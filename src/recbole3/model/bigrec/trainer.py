@@ -308,6 +308,13 @@ class BIGRecTrainer:
         Uses left-padding so that the last real token of each sequence always
         falls at position ``-1`` of the padded batch, making pooling trivial.
 
+        Memory-efficient path: calls the base transformer (e.g.
+        ``LlamaForCausalLM.model``) directly so the forward only materialises
+        a single ``[B, seq_len, H]`` tensor (``last_hidden_state``) instead of
+        a 33-layer tuple — ``output_hidden_states=True`` on LLaMA-3.1-8B with
+        batch=32 seq=512 materialises ~4 GiB of intermediate states and
+        triggers CUDA OOM after a vLLM beam-search run has fragmented VRAM.
+
         Args:
             model: Loaded CausalLM (with or without LoRA).
             tokenizer: Tokenizer; ``padding_side`` will be temporarily set to
@@ -322,6 +329,14 @@ class BIGRecTrainer:
         orig_padding_side = tokenizer.padding_side
         tokenizer.padding_side = "left"
 
+        # Resolve the base transformer.  For LlamaForCausalLM (and most CausalLM
+        # families), ``.model`` is the underlying transformer whose forward
+        # returns BaseModelOutputWithPast.last_hidden_state — already post the
+        # final layer-norm, so it is numerically identical to
+        # ``CausalLM(..., output_hidden_states=True).hidden_states[-1]``.
+        # Pre-existing cached item embeddings stay compatible.
+        base_transformer = getattr(model, "model", model)
+
         all_embs: list[torch.Tensor] = []
 
         for batch_texts in batchify(texts, batch_size):
@@ -334,14 +349,13 @@ class BIGRecTrainer:
             ).to(device)
 
             with torch.no_grad():
-                outputs = model(
-                    **encoded,
-                    output_hidden_states=True,
+                outputs = base_transformer(
+                    input_ids=encoded["input_ids"],
+                    attention_mask=encoded["attention_mask"],
                     use_cache=False,
                 )
 
-            # hidden_states: tuple of (num_layers+1) tensors, each [B, seq_len, H].
-            last_layer: torch.Tensor = outputs.hidden_states[-1]  # [B, seq_len, H]
+            last_layer: torch.Tensor = outputs.last_hidden_state  # [B, seq_len, H]
             # Left-padding guarantees the last real token is at index -1.
             batch_emb = last_layer[:, -1, :].float().cpu()  # [B, H]
             all_embs.append(batch_emb)

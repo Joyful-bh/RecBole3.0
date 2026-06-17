@@ -35,8 +35,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from typing import Any
+
+# Marker that ends the Alpaca-style prompt produced by build_prompt() in
+# recbole3.model.bigrec.data.  vLLM ≥ 0.6.4 decodes BeamSearchSequence.text
+# from prompt_token_ids + output_token_ids, so the full prompt is included
+# in the returned text — we mirror the official BIGRec inference.py and
+# split on this marker to isolate the generated portion.
+_RESPONSE_MARKER: str = "### Response:\n"
+
+# Trailing chat-template special tokens (LLaMA-3 <|eot_id|>, GPT-style
+# <|endoftext|>, etc.) that vLLM may leave in the decoded text — strip them
+# so embedding extraction sees plain item-title text, identical to how the
+# pre-computed item embeddings were generated.
+_TRAILING_SPECIAL_TOKEN_RE: re.Pattern[str] = re.compile(r"\s*<\|[^|]+\|>\s*$")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -73,35 +87,52 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _extract_top1_text(beam_output: Any) -> str:
-    """Extract the top-1 generated text from a single ``LLM.beam_search`` result.
+    """Extract the top-1 *generated* text from a single ``LLM.beam_search`` result.
 
-    The exact attribute layout of vLLM's ``BeamSearchOutput`` has shifted across
-    versions; this helper checks the two known shapes and falls back to empty
-    string so the caller can detect missing generations.
+    vLLM's ``BeamSearchSequence.text`` is decoded from
+    ``prompt_token_ids + output_token_ids``, so the raw string contains the
+    full original prompt followed by the model's continuation.  This helper:
+
+    1. Picks the best-scoring beam (``sequences[0]``).
+    2. Strips everything up to and including ``### Response:\\n`` so only the
+       generated portion remains — same approach as the official BIGRec
+       ``inference.py`` (``output.split('Response:\\n')[-1]``).
+    3. Strips trailing chat-template special tokens (e.g. ``<|eot_id|>``)
+       that vLLM leaves in when decoding without ``skip_special_tokens=True``.
+
+    Returns an empty string when neither known attribute layout is present,
+    so the caller can detect and report missing generations.
 
     Args:
         beam_output: One element of the list returned by ``LLM.beam_search``.
 
     Returns:
-        Generated text for the highest-log-probability beam.
+        Generated item-title text for the highest-log-probability beam, with
+        prompt prefix and special-token suffix removed.
     """
     # vLLM ≥ 0.6.4: BeamSearchOutput has .sequences = list[BeamSearchSequence],
-    # sorted by descending cumulative log-probability.  Each sequence has a
-    # `.text` attribute holding the decoded continuation.
+    # sorted by descending cumulative log-probability.
     sequences = getattr(beam_output, "sequences", None)
-    if sequences:
-        text = getattr(sequences[0], "text", None)
-        if text is not None:
-            return text
+    if not sequences:
+        # Fallback: some vLLM versions expose `.outputs` (mirroring RequestOutput).
+        sequences = getattr(beam_output, "outputs", None)
+    if not sequences:
+        return ""
 
-    # Fallback: some vLLM versions expose `.outputs` (mirroring RequestOutput).
-    outputs = getattr(beam_output, "outputs", None)
-    if outputs:
-        text = getattr(outputs[0], "text", None)
-        if text is not None:
-            return text
+    text = getattr(sequences[0], "text", None)
+    if not text:
+        return ""
 
-    return ""
+    # 1. Drop the prompt prefix.  Use rsplit so a stray "### Response:\n"
+    #    occurring inside the user history (extremely unlikely but possible
+    #    if an item title contains the marker) is ignored.
+    if _RESPONSE_MARKER in text:
+        text = text.rsplit(_RESPONSE_MARKER, 1)[-1]
+
+    # 2. Drop trailing chat-template special tokens.
+    text = _TRAILING_SPECIAL_TOKEN_RE.sub("", text)
+
+    return text
 
 
 def main() -> int:

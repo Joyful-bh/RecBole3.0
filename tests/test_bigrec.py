@@ -162,11 +162,18 @@ class _MockTokenizer:
 
 
 class _FakeOutput:
-    """Fake model forward output with deterministic hidden states."""
+    """Fake model forward output with deterministic hidden states.
+
+    Exposes both ``hidden_states`` (the multi-layer tuple, kept for any test
+    still relying on it) and ``last_hidden_state`` (the single final-layer
+    tensor) — mirrors HF's ``BaseModelOutputWithPast`` and lets the trainer's
+    memory-efficient base-transformer call path work in tests.
+    """
 
     def __init__(self, B: int, seq_len: int, H: int = 4) -> None:
         hidden = torch.randn(B, seq_len, H)
-        # Tuple of (num_layers+1) tensors; trainer uses index -1.
+        self.last_hidden_state: torch.Tensor = hidden
+        # Tuple of (num_layers+1) tensors; legacy shape for back-compat.
         self.hidden_states: tuple[torch.Tensor, ...] = (hidden,) * 3
 
 

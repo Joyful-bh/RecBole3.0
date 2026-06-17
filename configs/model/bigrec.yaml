@@ -7,7 +7,7 @@ model:
 
   # ── LLM Backbone ────────────────────────────────────────────────────────────
   llm_path: "/mnt/data/model/Llama-3.1-8B-Instruct"   # REQUIRED: local path or HF hub id
-  device_id: 0                          # GPU index (ignored under torchrun)
+  device_id: 6                          # GPU index (ignored under torchrun)
   pipeline_parallel: false              # shard model across pipeline_parallel_gpus GPUs
   pipeline_parallel_gpus: 2
   torch_dtype: float16                  # "float16" or "bfloat16"
@@ -24,8 +24,8 @@ model:
     - v_proj
 
   # ── Tokenization ────────────────────────────────────────────────────────────
-  max_input_length: 512                 # max tokens for prompt (instruction + input)
-  max_new_tokens: 64                    # max tokens generated during beam search
+  max_input_length: 2048                 # max tokens for prompt (instruction + input)
+  max_new_tokens: 128                    # max tokens generated during beam search
 
   # ── SFT Training ────────────────────────────────────────────────────────────
   train_on_inputs: true                 # true = full-sequence loss (official default)
@@ -47,15 +47,15 @@ model:
   load_best_model_at_end: true
   deepspeed: null                       # path to a DeepSpeed JSON config, or null
   early_stopping_patience: 5
-  sample_num: -1                        # -1 = full dataset; N = subsample N rows
-  max_steps: 500                        # hard step cap; -1 = use num_train_epochs
+  sample_num: 1024                        # -1 = full dataset; N = subsample N rows
+  max_steps: -1                      # hard step cap; -1 = use num_train_epochs
 
   # ── Beam-Search Generation ───────────────────────────────────────────────────
   num_beams: 4
   eval_batch_size: 4
 
   # ── Embedding Grounding ──────────────────────────────────────────────────────
-  history_max_length: 10                # most-recent history items in the prompt
+  history_max_length: 20                # most-recent history items in the prompt
   item_text_field: title                # item_table column for item name text
   fallback_item_text_field: metadata_text
   domain: product                       # "movie", "product", or "item"
@@ -87,8 +87,8 @@ model:
   # Generation runs in a one-shot subprocess calling LLM.beam_search (vLLM's
   # only beam-search-capable API from 0.6.4 onward).  Set vllm_conda_env if
   # vLLM lives in a different conda env from the training environment.
-  vllm_conda_env: ""                    # conda env name with vLLM; empty = current env
-  vllm_device_id: 0                     # starting GPU index for the vLLM subprocess
+  vllm_conda_env: "vllm"                    # conda env name with vLLM; empty = current env
+  vllm_device_id: 8                     # starting GPU index for the vLLM subprocess
   vllm_tensor_parallel_size: 1          # number of GPUs for vLLM tensor parallelism (>1 for large models)
   vllm_gpu_memory_utilization: 0.9      # fraction of GPU VRAM vLLM pre-allocates; lower if OOM on startup
 
