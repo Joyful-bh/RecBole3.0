@@ -1,38 +1,20 @@
-"""BIGRec trainer: LoRA SFT fine-tuning + embedding-grounding evaluation.
+"""BIGRec LoRA SFT trainer.
 
-Two-step BIGRec paradigm (arXiv:2308.08434):
-  Step 1 (fit):      Fine-tune a CausalLM with LoRA to generate item titles
-                     given a user's interaction history.
-  Step 2 (evaluate): Generate a title via beam-search, embed it, and rank all
-                     candidate items by L2 distance to the oracle embedding,
-                     optionally reweighted by popularity / CF signals (Eq. 3).
-
-Grounding weight injection (Eq. 3)
------------------------------------
-When ``config.grounding_mode`` is not ``'none'``, raw L2 distances are first
-min-max normalised per row, then multiplied by a per-item weight factor:
-
-    D̂ᵢ = (Dᵢ − min_j Dⱼ) / (max_j Dⱼ − min_j Dⱼ)
-    D̃ᵢ = D̂ᵢ × (1 + Wᵢ)^(−γ)
-
-where Wᵢ ∈ [0, 1] is the grounding weight (popularity or CF score) and γ is a
-hyperparameter.  A higher Wᵢ decreases D̃ᵢ, promoting the item in the ranking.
+This module owns model/tokenizer loading and the HuggingFace ``Trainer`` based
+fine-tuning loop. Generation and grounding evaluation live in ``generator.py``
+and ``grounding.py``; thin wrappers remain here for compatibility with existing
+tests and call sites.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
-import subprocess
-import sys
 from typing import Any, Literal
 
-import numpy as np
 import pandas as pd
 import torch
-from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -42,16 +24,15 @@ from transformers import (
     TrainingArguments,
 )
 
-from recbole3.dataset.utils import CANDIDATE_ITEM_IDS, ITEM_ID
-from recbole3.model.sequential import HISTORY_ITEM_IDS
-from recbole3.evaluation.metric import NDCGMetric, RecallMetric, RetrievalEvalData
+from recbole3.dataset.utils import ITEM_ID
+from recbole3.evaluation.metric import RetrievalEvalData
 from recbole3.model.bigrec.config import BIGRecConfig
 from recbole3.model.bigrec.data import (
     BIGRecSFTDataset,
-    batchify,
-    build_eval_prompts,
     build_item_text_lookup,
 )
+from recbole3.model.bigrec.generator import BIGRecGenerator
+from recbole3.model.bigrec.grounding import BIGRecGrounder
 
 logger = logging.getLogger(__name__)
 
@@ -60,21 +41,13 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PAD_TOKEN_ID: int = 0   # unk_token_id; used when pad_token_id is None
 _DEFAULT_EOS_TOKEN_ID: int = 2   # </s>; used when eos_token_id is None
 
-# Absolute filesystem path of the offline-generation subprocess entry point.
-# Invoked by path (not `python -m`) so the vLLM conda env only needs `vllm`
-# installed — it does NOT need to be able to `import recbole3`.  This keeps
-# the training env and the inference env fully decoupled.
-_VLLM_OFFLINE_SCRIPT: str = os.path.join(os.path.dirname(__file__), "vllm_offline.py")
-
-
 class BIGRecTrainer:
-    """BIGRec trainer: LoRA SFT fine-tuning and embedding-grounding evaluation.
+    """BIGRec trainer for LoRA SFT fine-tuning.
 
-    The trainer is intentionally self-contained — it does not inherit from
-    RecBole3.0's ``Trainer`` class, mirroring the LCRecTrainer pattern.  It
-    delegates the inner optimization loop to the HuggingFace ``Trainer`` while
-    owning model loading, checkpointing, embedding pre-computation, and the
-    final Recall/NDCG metric reporting.
+    The trainer is intentionally self-contained: it does not inherit from
+    RecBole3.0's ``Trainer`` class, mirroring the LCRecTrainer pattern. It
+    delegates the optimization loop to HuggingFace ``Trainer`` and delegates
+    generation / grounding evaluation to dedicated helper components.
 
     Args:
         config: Fully resolved :class:`BIGRecConfig` dataclass.
@@ -82,6 +55,20 @@ class BIGRecTrainer:
 
     def __init__(self, config: BIGRecConfig) -> None:
         self.config = config
+
+    def _generator(self) -> BIGRecGenerator:
+        return BIGRecGenerator(
+            self.config,
+            is_main_process=self._is_main_process,
+            log=self._log,
+        )
+
+    def _grounder(self) -> BIGRecGrounder:
+        return BIGRecGrounder(
+            self.config,
+            is_main_process=self._is_main_process,
+            log=self._log,
+        )
 
     # ── Utility helpers ────────────────────────────────────────────────────────
 
@@ -127,14 +114,15 @@ class BIGRecTrainer:
 
     # ── Tokenizer ─────────────────────────────────────────────────────────────
 
-    def _load_tokenizer(self, padding_side: str = "right") -> AutoTokenizer:
+    def _load_tokenizer(self, padding_side: str = "left") -> AutoTokenizer:
         """Load the HuggingFace tokenizer from ``config.llm_path``.
 
         Args:
-            padding_side: ``'right'`` during SFT training;
-                          ``'left'`` for batch beam-search generation and
-                          embedding extraction (aligns the real last token to
-                          index ``-1``).
+            padding_side: Padding direction for tokenizer outputs. BIGRec uses
+                          ``'left'`` during SFT training to match the official
+                          implementation, and also during batch beam-search
+                          generation / embedding extraction so the real last
+                          token aligns to index ``-1``.
 
         Returns:
             Loaded tokenizer with ``pad_token_id`` guaranteed non-None.
@@ -303,65 +291,8 @@ class BIGRecTrainer:
         batch_size: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Encode *texts* and return last-token hidden states from the last layer.
-
-        Uses left-padding so that the last real token of each sequence always
-        falls at position ``-1`` of the padded batch, making pooling trivial.
-
-        Memory-efficient path: calls the base transformer (e.g.
-        ``LlamaForCausalLM.model``) directly so the forward only materialises
-        a single ``[B, seq_len, H]`` tensor (``last_hidden_state``) instead of
-        a 33-layer tuple — ``output_hidden_states=True`` on LLaMA-3.1-8B with
-        batch=32 seq=512 materialises ~4 GiB of intermediate states and
-        triggers CUDA OOM after a vLLM beam-search run has fragmented VRAM.
-
-        Args:
-            model: Loaded CausalLM (with or without LoRA).
-            tokenizer: Tokenizer; ``padding_side`` will be temporarily set to
-                       ``'left'`` for the duration of this call.
-            texts: Text strings to encode.
-            batch_size: Forward-pass batch size.
-            device: Inference device.
-
-        Returns:
-            Float32 CPU tensor of shape ``[len(texts), hidden_size]``.
-        """
-        orig_padding_side = tokenizer.padding_side
-        tokenizer.padding_side = "left"
-
-        # Resolve the base transformer.  For LlamaForCausalLM (and most CausalLM
-        # families), ``.model`` is the underlying transformer whose forward
-        # returns BaseModelOutputWithPast.last_hidden_state — already post the
-        # final layer-norm, so it is numerically identical to
-        # ``CausalLM(..., output_hidden_states=True).hidden_states[-1]``.
-        # Pre-existing cached item embeddings stay compatible.
-        base_transformer = getattr(model, "model", model)
-
-        all_embs: list[torch.Tensor] = []
-
-        for batch_texts in batchify(texts, batch_size):
-            encoded = tokenizer(
-                batch_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=self.config.max_input_length,
-            ).to(device)
-
-            with torch.no_grad():
-                outputs = base_transformer(
-                    input_ids=encoded["input_ids"],
-                    attention_mask=encoded["attention_mask"],
-                    use_cache=False,
-                )
-
-            last_layer: torch.Tensor = outputs.last_hidden_state  # [B, seq_len, H]
-            # Left-padding guarantees the last real token is at index -1.
-            batch_emb = last_layer[:, -1, :].float().cpu()  # [B, H]
-            all_embs.append(batch_emb)
-
-        tokenizer.padding_side = orig_padding_side
-        return torch.cat(all_embs, dim=0)  # [len(texts), H]
+        """Encode text strings as BIGRec grounding embeddings."""
+        return self._grounder().extract_embeddings(model, tokenizer, texts, batch_size, device)
 
     def _precompute_item_embeddings(
         self,
@@ -371,175 +302,35 @@ class BIGRecTrainer:
         cache_path: str,
         device: torch.device,
     ) -> torch.Tensor:
-        """Return item embeddings, loading from disk cache when available.
-
-        The on-disk cache is a ``.pt`` file with a float32 tensor of shape
-        ``[num_items, hidden_size]``.
-
-        Args:
-            model: CausalLM used for embedding extraction.
-            tokenizer: Tokenizer.
-            item_texts: Title strings indexed by framework ``item_id``.
-                        Index 0 is the reserved placeholder item.
-            cache_path: Full path to the ``.pt`` cache file.
-            device: Device for the forward pass.
-
-        Returns:
-            CPU tensor of shape ``[num_items, hidden_size]``.
-        """
-        if not self.config.refresh_embedding_cache and os.path.isfile(cache_path):
-            self._log("Loading item embeddings from cache: %s", cache_path)
-            return torch.load(cache_path, map_location="cpu", weights_only=True)
-
-        self._log("Pre-computing embeddings for %d items …", len(item_texts))
-        embeddings = self._extract_embeddings(
+        """Return item embeddings, loading from disk cache when available."""
+        return self._grounder().precompute_item_embeddings(
             model,
             tokenizer,
             item_texts,
-            batch_size=self.config.embedding_batch_size,
-            device=device,
-        )  # [num_items, H], on CPU
-
-        if self._is_main_process():
-            cache_dir = os.path.dirname(cache_path)
-            if cache_dir:
-                os.makedirs(cache_dir, exist_ok=True)
-            torch.save(embeddings, cache_path)
-            self._log("Item embeddings saved to %s", cache_path)
-
-        return embeddings
-
-    # ── Grounding weight injection (Eq. 3) ────────────────────────────────────
+            cache_path,
+            device,
+            extract_embeddings=self._extract_embeddings,
+        )
 
     def _compute_popularity_weights(
         self,
         task_data: Any,
         num_items: int,
     ) -> torch.Tensor:
-        """Compute min-max normalised item popularity from training interactions.
-
-        Popularity Cᵢ = Nᵢ / Σⱼ Nⱼ where Nᵢ is the interaction count of item i
-        in the training split.  Cᵢ is then min-max normalised to Pᵢ ∈ [0, 1].
-
-        Args:
-            task_data: Prepared ``BIGRecModelDataset`` with a training split.
-            num_items: Total number of items (length of the returned tensor).
-
-        Returns:
-            Float tensor of shape ``[num_items]`` with values in ``[0, 1]``.
-        """
-        train_frame: pd.DataFrame = task_data.get_train_dataset().frame  # type: ignore[attr-defined]
-        counts = torch.zeros(num_items, dtype=torch.float32)
-
-        for item_id, n in train_frame[ITEM_ID].value_counts().items():
-            idx = int(item_id)
-            if 0 <= idx < num_items:
-                counts[idx] = float(n)
-
-        total = counts.sum()
-        if total <= 0.0:
-            self._log("Popularity: all interaction counts are zero; weights default to 0.", level="warning")
-            return counts
-
-        ci = counts / total                           # raw frequency Cᵢ
-        c_min, c_max = ci.min(), ci.max()
-        if c_max > c_min:
-            pi = (ci - c_min) / (c_max - c_min)      # min-max normalise → [0, 1]
-        else:
-            pi = torch.zeros_like(ci)
-
-        self._log(
-            "Popularity weights — mean=%.4f, max=%.4f, min=%.4f",
-            pi.mean().item(), pi.max().item(), pi.min().item(),
-        )
-        return pi  # [num_items]
+        """Compute min-max normalised item popularity from training interactions."""
+        return self._grounder().compute_popularity_weights(task_data, num_items)
 
     def _load_cf_weights(self, num_items: int) -> torch.Tensor:
-        """Load and normalise pre-computed CF model scores from disk.
-
-        The file must be a ``.pt`` file containing a 1-D float tensor of shape
-        ``[num_items]``.  Scores are min-max normalised to ``[0, 1]`` so they
-        are on the same scale as the popularity weights.
-
-        Args:
-            num_items: Expected number of items (for shape validation).
-
-        Returns:
-            Float tensor of shape ``[num_items]`` with values in ``[0, 1]``.
-
-        Raises:
-            FileNotFoundError: If ``config.cf_score_path`` is unset or missing.
-            ValueError: If the loaded tensor's size does not match *num_items*.
-        """
-        path = self.config.cf_score_path
-        if not path or not os.path.isfile(path):
-            raise FileNotFoundError(
-                f"CF score file not found: '{path}'. "
-                "Set BIGRecConfig.cf_score_path to a .pt file with shape [num_items]."
-            )
-
-        scores: torch.Tensor = torch.load(path, weights_only=True, map_location="cpu").float()
-
-        if scores.ndim != 1 or scores.shape[0] != num_items:
-            raise ValueError(
-                f"CF score tensor shape {tuple(scores.shape)} does not match "
-                f"num_items={num_items}. Expected a 1-D tensor of length {num_items}."
-            )
-
-        s_min, s_max = scores.min(), scores.max()
-        if s_max > s_min:
-            scores = (scores - s_min) / (s_max - s_min)
-        else:
-            scores = torch.zeros_like(scores)
-
-        self._log(
-            "CF weights — mean=%.4f, max=%.4f, min=%.4f",
-            scores.mean().item(), scores.max().item(), scores.min().item(),
-        )
-        return scores  # [num_items]
+        """Load and normalise pre-computed CF model scores from disk."""
+        return self._grounder().load_cf_weights(num_items)
 
     def _build_grounding_weights(
         self,
         task_data: Any,
         num_items: int,
     ) -> torch.Tensor | None:
-        """Build the combined grounding weight vector for Eq. 3.
-
-        Depending on ``config.grounding_mode``:
-
-        * ``'none'``:           Returns ``None`` (pure L2, no reweighting).
-        * ``'popularity'``:     Returns min-max normalised popularity Pᵢ.
-        * ``'cf'``:             Returns min-max normalised CF scores.
-        * ``'popularity+cf'``:  Sums both signals, then re-normalises to [0, 1].
-
-        Args:
-            task_data: Prepared ``BIGRecModelDataset``.
-            num_items: Number of items (weight vector length).
-
-        Returns:
-            Float CPU tensor of shape ``[num_items]`` in ``[0, 1]``, or ``None``
-            when no reweighting is configured.
-        """
-        mode = self.config.grounding_mode.strip().lower()
-        if mode == "none":
-            return None
-
-        weights = torch.zeros(num_items, dtype=torch.float32)
-
-        if "popularity" in mode:
-            weights = weights + self._compute_popularity_weights(task_data, num_items)
-
-        if "cf" in mode:
-            weights = weights + self._load_cf_weights(num_items)
-
-        # Re-normalise after combining so the sum stays in [0, 1] for Eq. 3.
-        if "popularity" in mode and "cf" in mode:
-            w_min, w_max = weights.min(), weights.max()
-            if w_max > w_min:
-                weights = (weights - w_min) / (w_max - w_min)
-            self._log("Combined popularity+CF weights built (re-normalised).")
-
-        return weights  # [num_items], CPU
+        """Build the combined grounding weight vector for Eq. 3."""
+        return self._grounder().build_grounding_weights(task_data, num_items)
 
     @staticmethod
     def _apply_grounding_weights(
@@ -547,28 +338,8 @@ class BIGRecTrainer:
         weights: torch.Tensor,
         gamma: float,
     ) -> torch.Tensor:
-        """Apply Eq. 3 to reweight L2 distances by popularity / CF signal.
-
-        Per-row min-max normalises the raw distances, then multiplies by the
-        inverse weight factor: D̃ᵢ = D̂ᵢ × (1 + Wᵢ)^(−γ).
-        A higher Wᵢ → smaller D̃ᵢ → item ranks higher.
-
-        Args:
-            dist: Raw L2 distances, shape ``[B, num_items]``, on any device.
-            weights: Per-item grounding weights, shape ``[num_items]``,
-                     values in ``[0, 1]``.  Must be on the same device as *dist*.
-            gamma: Exponent γ ≥ 0.  Larger values amplify the weight effect.
-
-        Returns:
-            Reweighted distances of shape ``[B, num_items]`` on the same device
-            as *dist*.
-        """
-        dist_min = dist.min(dim=1, keepdim=True)[0]  # [B, 1]
-        dist_max = dist.max(dim=1, keepdim=True)[0]  # [B, 1]
-        dist_hat = (dist - dist_min) / (dist_max - dist_min + 1e-8)  # [B, num_items]
-
-        multiplier = torch.pow(1.0 + weights.unsqueeze(0), -gamma)  # [1, num_items]
-        return dist_hat * multiplier  # [B, num_items]
+        """Apply Eq. 3 to reweight L2 distances by popularity / CF signal."""
+        return BIGRecGrounder.apply_grounding_weights(dist, weights, gamma)
 
     # ── Training ──────────────────────────────────────────────────────────────
 
@@ -618,8 +389,8 @@ class BIGRecTrainer:
                 os.environ["CUDA_VISIBLE_DEVICES"] = str(self.config.device_id)
                 self._log("Single-GPU mode: CUDA_VISIBLE_DEVICES=%s", self.config.device_id)
 
-        # 1. Tokenizer (right-padding during SFT).
-        tokenizer = self._load_tokenizer(padding_side="right")
+        # 1. Tokenizer (left-padding during SFT, matching official BIGRec).
+        tokenizer = self._load_tokenizer(padding_side="left")
         if self._is_main_process():
             tokenizer.save_pretrained(output_dir)
 
@@ -784,97 +555,24 @@ class BIGRecTrainer:
 
     @staticmethod
     def _default_gamma_search_values() -> tuple[float, ...]:
-        """Return the official BIGRec 199-value gamma grid.
+        """Return the official BIGRec 199-value gamma grid."""
+        return BIGRecGrounder.default_gamma_search_values()
 
-        Mirrors the official implementation: 0.00, 0.01, …, 0.99 (fine-grained)
-        followed by 1, 2, …, 99 (coarse-grained).
-
-        Returns:
-            Tuple of 199 float gamma candidates.
-        """
-        fine: tuple[float, ...] = tuple(round(i * 0.01, 2) for i in range(100))   # 0.00 … 0.99
-        coarse: tuple[float, ...] = tuple(float(i) for i in range(1, 100))         # 1.0  … 99.0
+    # 1.0  … 99.0
         return fine + coarse  # 199 values
 
     # ── vLLM server management ────────────────────────────────────────────────
 
     def _resolve_vllm_python(self) -> str:
-        """Return the Python executable to use for the vLLM server subprocess.
-
-        When ``config.vllm_conda_env`` is empty, returns ``sys.executable``
-        (the current interpreter, which must have vLLM installed).  Otherwise
-        resolves ``<conda_base>/envs/<vllm_conda_env>/bin/python`` by querying
-        ``conda info --base``.
-
-        Returns:
-            Absolute path to a Python executable.
-
-        Raises:
-            RuntimeError: If conda is not on PATH or ``conda info --base`` fails.
-            FileNotFoundError: If the resolved Python path does not exist.
-        """
-        if not self.config.vllm_conda_env:
-            return sys.executable
-
-        try:
-            result = subprocess.run(
-                ["conda", "info", "--base"],
-                capture_output=True, text=True, timeout=15, check=True,
-            )
-            conda_base = result.stdout.strip()
-        except FileNotFoundError:
-            raise RuntimeError(
-                "conda not found on PATH. "
-                "Add conda to PATH or set vllm_conda_env='' to use the current interpreter."
-            ) from None
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"'conda info --base' failed: {exc.stderr.strip()}"
-            ) from exc
-
-        python_rel = (
-            os.path.join("Scripts", "python.exe")
-            if sys.platform == "win32"
-            else os.path.join("bin", "python")
-        )
-        python_path = os.path.join(conda_base, "envs", self.config.vllm_conda_env, python_rel)
-        if not os.path.isfile(python_path):
-            raise FileNotFoundError(
-                f"Python not found at {python_path!r}. "
-                f"Check that conda env '{self.config.vllm_conda_env}' exists."
-            )
-        return python_path
+        """Return the Python executable to use for the vLLM subprocess."""
+        return self._generator().resolve_vllm_python()
 
     def _collect_eval_targets(
         self,
         eval_frame: pd.DataFrame,
     ) -> tuple[list[int], list[list[int] | None]]:
-        """Extract target item_ids and per-row candidate lists from an eval split.
-
-        Pulled into a helper so the prompt-building and target-collection passes
-        can stay in lock-step (one row in *eval_frame* → one prompt → one target
-        → one candidate list).
-
-        Args:
-            eval_frame: DataFrame batch from the eval ``FrameDataset``.
-
-        Returns:
-            Tuple ``(target_ids, cand_lists)`` aligned with *eval_frame*'s row order.
-        """
-        target_ids: list[int] = []
-        cand_lists: list[list[int] | None] = []
-        for row in eval_frame.itertuples(index=False):
-            target_ids.append(int(getattr(row, ITEM_ID)))
-            cand_val = getattr(row, CANDIDATE_ITEM_IDS, None)
-            if cand_val is None or (
-                not hasattr(cand_val, "__len__")
-                and isinstance(cand_val, float)
-                and np.isnan(cand_val)
-            ):
-                cand_lists.append(None)
-            else:
-                cand_lists.append(list(cand_val))
-        return target_ids, cand_lists
+        """Extract target item ids and per-row candidate lists from an eval split."""
+        return BIGRecGenerator.collect_eval_targets(eval_frame)
 
     def _run_vllm_offline(
         self,
@@ -882,102 +580,8 @@ class BIGRecTrainer:
         checkpoint_path: str,
         work_dir: str,
     ) -> list[str]:
-        """Run vLLM ``LLM.beam_search`` in a one-shot subprocess and return outputs.
-
-        Implementation: writes *prompts* to a JSON file in *work_dir*, spawns
-        ``python -m recbole3.model.bigrec.vllm_offline`` (in
-        ``config.vllm_conda_env``'s interpreter), then reads back the generated
-        texts from a sibling output JSON file.
-
-        Beam search is the only way to get width-N search out of vLLM ≥ 0.6.4
-        (the OpenAI-compatible server's ``use_beam_search`` flag was removed),
-        and ``LLM.beam_search`` requires the model to be loaded in the same
-        process — hence the subprocess instead of an HTTP server.
-
-        Args:
-            prompts: Full inference prompts (already include ``### Response:\\n``).
-            checkpoint_path: LoRA adapter directory; ignored when ``use_lora=False``.
-            work_dir: Directory for the transient prompts / output JSON files.
-
-        Returns:
-            List of generated text strings, one per prompt, post-stripping
-            whitespace and the outer ``"``…``"`` quotes the model was trained
-            to emit.
-
-        Raises:
-            RuntimeError: If the subprocess exits non-zero or returns a result
-                          list whose length disagrees with the input prompts.
-        """
-        python_exe = self._resolve_vllm_python()
-        max_model_len: int = self.config.max_input_length + self.config.max_new_tokens
-        tp: int = max(1, self.config.vllm_tensor_parallel_size)
-        vllm_gpu_ids: str = ",".join(
-            str(self.config.vllm_device_id + i) for i in range(tp)
-        )
-
-        # Persist transient JSON files in the run's work_dir so they survive
-        # for post-mortem inspection if the subprocess crashes mid-run.
-        os.makedirs(work_dir, exist_ok=True)
-        prompts_path = os.path.join(work_dir, "vllm_prompts.json")
-        output_path = os.path.join(work_dir, "vllm_outputs.json")
-        with open(prompts_path, "w", encoding="utf-8") as f:
-            json.dump(prompts, f, ensure_ascii=False)
-
-        cmd: list[str] = [
-            python_exe, _VLLM_OFFLINE_SCRIPT,
-            "--prompts", prompts_path,
-            "--output", output_path,
-            "--model", self.config.llm_path,
-            "--dtype", self.config.torch_dtype,
-            "--beam-width", str(max(1, self.config.num_beams)),
-            "--max-tokens", str(self.config.max_new_tokens),
-            "--max-model-len", str(max_model_len),
-            "--tp", str(tp),
-            "--gpu-memory-utilization", str(self.config.vllm_gpu_memory_utilization),
-        ]
-        if self.config.use_lora:
-            cmd += [
-                "--lora", checkpoint_path,
-                "--lora-rank", str(self.config.lora_r),
-            ]
-
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = vllm_gpu_ids
-
-        self._log(
-            "Launching vLLM offline beam-search: env=%s, CUDA_VISIBLE_DEVICES=%s, "
-            "tp=%d, beam_width=%d, n_prompts=%d%s",
-            self.config.vllm_conda_env or "(current)",
-            vllm_gpu_ids,
-            tp,
-            max(1, self.config.num_beams),
-            len(prompts),
-            f", lora={checkpoint_path}" if self.config.use_lora else "",
-        )
-
-        # Stream the subprocess output straight to our stdout/stderr so vLLM's
-        # model-loading and per-prompt progress remain visible.
-        completed = subprocess.run(cmd, env=env, check=False)
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"vLLM offline subprocess exited with code {completed.returncode}. "
-                f"Inspect the output above and the prompts file at {prompts_path}."
-            )
-
-        with open(output_path, "r", encoding="utf-8") as f:
-            raw_outputs: list[str] = json.load(f)
-
-        if len(raw_outputs) != len(prompts):
-            raise RuntimeError(
-                f"vLLM offline returned {len(raw_outputs)} outputs but "
-                f"{len(prompts)} prompts were sent."
-            )
-
-        clean_texts: list[str] = []
-        for idx, text in enumerate(raw_outputs):
-            cleaned = text.strip().strip('"').strip()
-            clean_texts.append(cleaned or f"[empty_{idx}]")
-        return clean_texts
+        """Run vLLM ``LLM.beam_search`` in a one-shot subprocess."""
+        return self._generator().run_vllm_offline(prompts, checkpoint_path, work_dir)
 
     def _generate_all_titles_vllm(
         self,
@@ -986,31 +590,10 @@ class BIGRecTrainer:
         checkpoint_path: str,
         work_dir: str,
     ) -> tuple[list[str], list[int], list[list[int] | None]]:
-        """Generate item titles for an eval split via the offline vLLM subprocess.
-
-        Args:
-            eval_frame: Evaluation DataFrame with ``history_item_ids`` and
-                        ``item_id`` columns; optionally ``candidate_item_ids``.
-            item_text_lookup: ``item_id → title`` mapping for prompt building.
-            checkpoint_path: LoRA adapter directory (passed to the subprocess).
-            work_dir: Directory for the transient JSON files.
-
-        Returns:
-            Tuple ``(clean_texts, target_ids, cand_lists)`` — one entry per row
-            in *eval_frame*.
-        """
-        prompts: list[str] = build_eval_prompts(eval_frame, item_text_lookup, self.config)
-        target_ids, cand_lists = self._collect_eval_targets(eval_frame)
-        clean_texts = self._run_vllm_offline(prompts, checkpoint_path, work_dir)
-
-        if self._is_main_process():
-            for i in range(min(3, len(clean_texts))):
-                logger.info(
-                    "[vLLM sample %d]  generated: %r  |  target: %r",
-                    i, clean_texts[i], item_text_lookup[target_ids[i]],
-                )
-
-        return clean_texts, target_ids, cand_lists
+        """Generate item titles for an eval split via the offline vLLM subprocess."""
+        return self._generator().generate_all_titles_vllm(
+            eval_frame, item_text_lookup, checkpoint_path, work_dir
+        )
 
     def _run_gamma_search(
         self,
@@ -1021,83 +604,16 @@ class BIGRecTrainer:
         device: torch.device,
         gamma_values: tuple[float, ...],
     ) -> dict[str, float]:
-        """Grid-search for the best gamma per metric×K on a validation split.
-
-        For each candidate gamma, applies Eq. 3, ranks all items, and computes
-        all configured metrics.  The best-performing gamma is tracked
-        *independently* per metric×K combination (official BIGRec behaviour).
-
-        Args:
-            dist: Pre-computed raw L2 distances of shape ``[N, num_items]``
-                  already on *device*.
-            grounding_weights: Per-item grounding weights ``[num_items]`` in
-                               ``[0, 1]`` on *device*.
-            target_ids: Ground-truth item_ids, length N.
-            cand_lists: Per-row candidate item_id lists (``None`` → full ranking).
-            device: Inference device.
-            gamma_values: Candidate γ values to evaluate.
-
-        Returns:
-            Dict mapping ``"metric@K"`` → best γ float.
-        """
-        maxk: int = max(self.config.eval_topk)
-        is_sampled: bool = self.config.eval_protocol == "sampled"
-        n: int = len(target_ids)
-
-        target_arr = np.array(target_ids, dtype=np.int64).reshape(n, 1)
-        mask_arr = np.ones((n, 1), dtype=bool)
-
-        metric_keys: list[str] = [
-            f"{m.lower()}@{k}"
-            for m in self.config.eval_metrics
-            for k in self.config.eval_topk
-        ]
-        best_scores: dict[str, float] = {key: -1.0 for key in metric_keys}
-        best_gammas: dict[str, float] = {key: gamma_values[0] for key in metric_keys}
-
-        for gamma in tqdm(
+        """Grid-search for the best gamma per metric@K on a validation split."""
+        return self._grounder().run_gamma_search(
+            dist,
+            grounding_weights,
+            target_ids,
+            cand_lists,
+            device,
             gamma_values,
-            desc="Gamma search",
-            disable=not self._is_main_process(),
-        ):
-            eff_dist: torch.Tensor = self._apply_grounding_weights(
-                dist, grounding_weights, gamma
-            )  # [N, num_items]
-
-            pred_list: list[np.ndarray] = []
-            for i in range(n):
-                cand = cand_lists[i]
-                if is_sampled and cand is not None:
-                    cand_t = torch.tensor(cand, dtype=torch.long, device=device)
-                    cand_dists = eff_dist[i, cand_t]
-                    sorted_idx = torch.argsort(cand_dists)[:maxk]
-                    top_k = cand_t[sorted_idx].cpu().numpy()
-                else:
-                    top_k = torch.argsort(eff_dist[i])[:maxk].cpu().numpy()
-
-                if len(top_k) < maxk:
-                    pad = np.full(maxk - len(top_k), -1, dtype=np.int64)
-                    top_k = np.concatenate([top_k, pad])
-                pred_list.append(top_k.reshape(1, maxk))
-
-            pred_arr = np.concatenate(pred_list, axis=0)  # [N, maxk]
-            eval_data = RetrievalEvalData(
-                pred_item_ids=pred_arr,
-                target_item_ids=target_arr,
-                target_mask=mask_arr,
-            )
-
-            scores = self._compute_metrics(eval_data)
-            for key, val in scores.items():
-                if val > best_scores.get(key, -1.0):
-                    best_scores[key] = val
-                    best_gammas[key] = gamma
-
-        self._log("Gamma search complete — best γ per metric@K:")
-        for key in metric_keys:
-            self._log("  %s → γ=%.3f  (val=%.4f)", key, best_gammas[key], best_scores[key])
-
-        return best_gammas
+            compute_metrics=self._compute_metrics,
+        )
 
     def _evaluate_from_dist_per_k_gammas(
         self,
@@ -1108,84 +624,10 @@ class BIGRecTrainer:
         best_gammas: dict[str, float],
         device: torch.device,
     ) -> dict[str, float]:
-        """Evaluate a split using the best gamma independently per metric×K.
-
-        For each ``(metric, K)`` pair the corresponding γ from gamma search
-        (found on the validation split) is applied to re-rank items, then only
-        that specific metric@K is computed.
-
-        Args:
-            dist: Pre-computed raw L2 distances ``[N, num_items]`` on *device*.
-            grounding_weights: Per-item grounding weights ``[num_items]`` on
-                               *device*, or ``None`` for pure L2.
-            target_ids: Ground-truth item_ids, length N.
-            cand_lists: Per-row candidate item_id lists (``None`` → full ranking).
-            best_gammas: Dict ``"metric@K"`` → best γ from :meth:`_run_gamma_search`.
-            device: Inference device.
-
-        Returns:
-            Dict of metric scores ``{"recall@K": float, "ndcg@K": float, …}``.
-        """
-        maxk: int = max(self.config.eval_topk)
-        is_sampled: bool = self.config.eval_protocol == "sampled"
-        n: int = len(target_ids)
-        target_arr = np.array(target_ids, dtype=np.int64).reshape(n, 1)
-        mask_arr = np.ones((n, 1), dtype=bool)
-
-        results: dict[str, float] = {}
-
-        for metric_name in self.config.eval_metrics:
-            name = metric_name.strip().lower()
-            if name not in ("recall", "ndcg"):
-                self._log("Unknown eval metric '%s' — skipping.", metric_name, level="warning")
-                continue
-
-            for k in self.config.eval_topk:
-                key = f"{name}@{k}"
-                gamma = best_gammas.get(key, self.config.grounding_gamma)
-
-                if grounding_weights is not None:
-                    eff_dist: torch.Tensor = self._apply_grounding_weights(
-                        dist, grounding_weights, gamma
-                    )  # [N, num_items]
-                else:
-                    eff_dist = dist
-
-                pred_list: list[np.ndarray] = []
-                for i in range(n):
-                    cand = cand_lists[i]
-                    if is_sampled and cand is not None:
-                        cand_t = torch.tensor(cand, dtype=torch.long, device=device)
-                        cand_dists = eff_dist[i, cand_t]
-                        sorted_idx = torch.argsort(cand_dists)[:k]
-                        top_k = cand_t[sorted_idx].cpu().numpy()
-                    else:
-                        top_k = torch.argsort(eff_dist[i])[:k].cpu().numpy()
-
-                    if len(top_k) < maxk:
-                        pad = np.full(maxk - len(top_k), -1, dtype=np.int64)
-                        top_k = np.concatenate([top_k, pad])
-                    pred_list.append(top_k.reshape(1, maxk))
-
-                pred_arr = np.concatenate(pred_list, axis=0)  # [N, maxk]
-                eval_data = RetrievalEvalData(
-                    pred_item_ids=pred_arr,
-                    target_item_ids=target_arr,
-                    target_mask=mask_arr,
-                )
-
-                if name == "recall":
-                    scores = RecallMetric((k,)).compute(eval_data)
-                else:
-                    scores = NDCGMetric((k,)).compute(eval_data)
-
-                if key in scores:
-                    results[key] = scores[key]
-                    self._log("  %s (γ=%.3f) = %.4f", key, gamma, scores[key])
-
-        return results
-
-    # ── Evaluation ────────────────────────────────────────────────────────────
+        """Evaluate a split using the best gamma independently per metric@K."""
+        return self._grounder().evaluate_from_dist_per_k_gammas(
+            dist, grounding_weights, target_ids, cand_lists, best_gammas, device
+        )
 
     def evaluate(
         self,
@@ -1365,133 +807,23 @@ class BIGRecTrainer:
         grounding_weights: torch.Tensor | None,
         device: torch.device,
     ) -> dict[str, float]:
-        """Batch-wise oracle embedding extraction + L2 ranking + metrics.
-
-        Called by :meth:`evaluate` (standard path) after beam-search generation
-        has completed and the generation model has been freed from VRAM.  Only
-        *emb_model* is in VRAM during this call, so the full ``embedding_batch_size``
-        can be used without risk of OOM.
-
-        Args:
-            emb_model: Embedding model (base CausalLM or fine-tuned model).
-            tokenizer: Left-padding tokenizer.
-            item_emb_device: Pre-computed item embeddings ``[num_items, H]`` on *device*.
-            generated_texts: Decoded titles from beam-search, one per eval row.
-            target_ids: Ground-truth item_ids, one per eval row.
-            cand_lists: Per-row candidate item_id lists (``None`` → full ranking).
-            grounding_weights: Optional per-item grounding weights ``[num_items]`` CPU.
-            device: Inference device.
-
-        Returns:
-            Dict of metric scores (``"recall@K"``, ``"ndcg@K"``, …).
-        """
-        weights_device: torch.Tensor | None = (
-            grounding_weights.to(device) if grounding_weights is not None else None
+        """Batch-wise oracle embedding extraction + L2 ranking + metrics."""
+        return self._grounder().rank_from_texts(
+            emb_model,
+            tokenizer,
+            item_emb_device,
+            generated_texts,
+            target_ids,
+            cand_lists,
+            grounding_weights,
+            device,
+            extract_embeddings=self._extract_embeddings,
+            compute_metrics=self._compute_metrics,
         )
-        maxk: int = max(self.config.eval_topk)
-        is_sampled: bool = self.config.eval_protocol == "sampled"
-        batch_size: int = self.config.embedding_batch_size
-        n: int = len(generated_texts)
-
-        all_pred_item_ids: list[np.ndarray] = []
-        all_target_item_ids: list[np.ndarray] = []
-        all_target_masks: list[np.ndarray] = []
-
-        pbar = tqdm(
-            range(0, n, batch_size),
-            desc="BIGRec oracle embed+rank",
-            disable=not self._is_main_process(),
-        )
-
-        for start in pbar:
-            batch_texts = generated_texts[start : start + batch_size]
-            batch_target_ids = target_ids[start : start + batch_size]
-            batch_cand_lists = cand_lists[start : start + batch_size]
-            actual_bs: int = len(batch_texts)
-
-            oracle_embs: torch.Tensor = self._extract_embeddings(
-                emb_model, tokenizer, batch_texts,
-                batch_size=actual_bs, device=device,
-            )  # [actual_bs, H] CPU
-            oracle_emb_device = oracle_embs.to(device)  # [actual_bs, H]
-
-            distances: torch.Tensor = torch.cdist(
-                oracle_emb_device, item_emb_device, p=2.0
-            )  # [actual_bs, num_items]
-
-            if weights_device is not None:
-                effective_dist: torch.Tensor = self._apply_grounding_weights(
-                    distances, weights_device, self.config.grounding_gamma
-                )
-            else:
-                effective_dist = distances
-
-            for i in range(actual_bs):
-                target_id = batch_target_ids[i]
-                if is_sampled:
-                    cand_val = batch_cand_lists[i]
-                    if cand_val is None:
-                        cand_ids_list: list[int] = list(range(item_emb_device.shape[0]))
-                    else:
-                        cand_ids_list = list(cand_val)
-                    cand_tensor = torch.tensor(cand_ids_list, dtype=torch.long, device=device)
-                    cand_dists = effective_dist[i, cand_tensor]
-                    sorted_cand_idx = torch.argsort(cand_dists)[:maxk]
-                    top_k_ids = cand_tensor[sorted_cand_idx].cpu().numpy()
-                    if len(top_k_ids) < maxk:
-                        pad = np.full(maxk - len(top_k_ids), -1, dtype=np.int64)
-                        top_k_ids = np.concatenate([top_k_ids, pad])
-                else:
-                    sorted_idx = torch.argsort(effective_dist[i])[:maxk]
-                    top_k_ids = sorted_idx.cpu().numpy()
-
-                all_pred_item_ids.append(top_k_ids.reshape(1, maxk))
-                all_target_item_ids.append(np.array([[target_id]], dtype=np.int64))
-                all_target_masks.append(np.array([[True]], dtype=bool))
-
-        pred_arr = np.concatenate(all_pred_item_ids, axis=0)       # [N, maxk]
-        target_arr = np.concatenate(all_target_item_ids, axis=0)   # [N, 1]
-        mask_arr = np.concatenate(all_target_masks, axis=0)        # [N, 1]
-
-        eval_data = RetrievalEvalData(
-            pred_item_ids=pred_arr,
-            target_item_ids=target_arr,
-            target_mask=mask_arr,
-        )
-        return self._compute_metrics(eval_data)
-
-    # ── Metrics ───────────────────────────────────────────────────────────────
 
     def _compute_metrics(self, eval_data: RetrievalEvalData) -> dict[str, float]:
-        """Compute Recall@K and NDCG@K from a :class:`RetrievalEvalData` object.
-
-        Args:
-            eval_data: Aggregated retrieval evaluation data over all users.
-
-        Returns:
-            Dict mapping ``"recall@K"`` / ``"ndcg@K"`` to scalar floats,
-            for every K in ``config.eval_topk``.
-        """
-        results: dict[str, float] = {}
-        ks: tuple[int, ...] = tuple(self.config.eval_topk)
-
-        for metric_name in self.config.eval_metrics:
-            name = metric_name.strip().lower()
-            if name == "recall":
-                scores = RecallMetric(ks).compute(eval_data)
-            elif name == "ndcg":
-                scores = NDCGMetric(ks).compute(eval_data)
-            else:
-                self._log(
-                    "Unknown eval metric '%s' — skipping.", metric_name, level="warning"
-                )
-                continue
-            results.update(scores)
-
-        for key, val in results.items():
-            self._log("  %s = %.4f", key, val)
-
-        return results
+        """Compute Recall@K and NDCG@K from retrieval evaluation data."""
+        return self._grounder().compute_metrics(eval_data)
 
 
 __all__ = ["BIGRecTrainer"]

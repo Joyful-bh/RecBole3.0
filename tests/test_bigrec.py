@@ -1082,6 +1082,38 @@ class TestTrainerFit:
 
         assert any(str(tmp_path) in p for p in tok_save_calls)
 
+    def test_fit_uses_left_padding_tokenizer_for_sft(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Official BIGRec trains with a left-padding tokenizer."""
+        data, _ = _prepare_bigrec_data()
+        cfg = BIGRecConfig(history_max_length=2, max_input_length=32, max_new_tokens=8)
+        trainer = BIGRecTrainer(cfg)
+        tok = _MockTokenizer()
+        fake_model = _FakeModel()
+        captured_padding_side: list[str] = []
+        captured_trainer_kwargs: dict[str, Any] = {}
+
+        def _load_tokenizer(*args: Any, **kwargs: Any) -> _MockTokenizer:
+            padding_side = str(kwargs.get("padding_side", "left"))
+            captured_padding_side.append(padding_side)
+            tok.padding_side = padding_side
+            return tok
+
+        def _capture_trainer(**kwargs: Any) -> MagicMock:
+            captured_trainer_kwargs.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(trainer, "_load_tokenizer", _load_tokenizer)
+        monkeypatch.setattr(trainer, "_load_model", lambda *a, **kw: fake_model)
+
+        with patch("recbole3.model.bigrec.trainer.HFTrainer", side_effect=_capture_trainer):
+            trainer.fit(data, output_dir=str(tmp_path))
+
+        assert captured_padding_side == ["left"]
+        assert tok.padding_side == "left"
+        assert captured_trainer_kwargs["data_collator"].tokenizer is tok
+
     def test_fit_passes_early_stopping_callback_to_hf_trainer(
         self, tmp_path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

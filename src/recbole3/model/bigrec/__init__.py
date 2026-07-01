@@ -16,11 +16,15 @@ from recbole3.model.bigrec.data import (
     build_item_text_lookup,
     build_prompt,
 )
+from recbole3.model.bigrec.generator import BIGRecGenerator
+from recbole3.model.bigrec.grounding import BIGRecGrounder
 from recbole3.model.bigrec.pipeline import BIGRecPipeline
 from recbole3.model.bigrec.trainer import BIGRecTrainer
 
 __all__ = [
     "BIGRecConfig",
+    "BIGRecGenerator",
+    "BIGRecGrounder",
     "BIGRecModelDataset",
     "BIGRecPipeline",
     "BIGRecSFTDataset",
