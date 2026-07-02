@@ -65,10 +65,14 @@ _DOMAIN_VOCAB: dict[str, dict[str, str]] = {
     },
 }
 
-# Alpaca-style system preamble (identical to the official implementation).
+# Alpaca-style system preamble.  The trailing space after "request." matches
+# official BIGRec train.py (generate_prompt) — BPE/SentencePiece merges around
+# whitespace are sensitive, so a missing space desyncs the full tokenization
+# after this point.  Official inference.py uses two trailing spaces; we mirror
+# train.py to keep training tokenization aligned.
 _PROMPT_PREAMBLE: str = (
     "Below is an instruction that describes a task, paired with an input that "
-    "provides further context. Write a response that appropriately completes the request.\n\n"
+    "provides further context. Write a response that appropriately completes the request. \n\n"
 )
 
 
@@ -344,73 +348,62 @@ class BIGRecSFTDataset(Dataset):
     ) -> dict[str, list[int]]:
         """Build one tokenized training sample.
 
-        The prompt part (everything before ``### Response:\\n``) gets labels
-        masked to ``-100``.  The response part (target title + EOS) is
-        supervised.
-
-        Args:
-            domain: Recommendation domain for prompt wording.
-            history_texts: List of history item title strings.
-            target_text: Target item title string.
-            max_length: Maximum total token length (truncates if exceeded).
-
-        Returns:
-            Dict with ``input_ids`` and ``labels`` lists.
+        Tokenization strategy mirrors the official BIGRec ``train.py``:
+        the full prompt (instruction + input + response) is encoded once as a
+        single string so BPE/SentencePiece merges across the ``### Response:\\n``
+        boundary are identical to the official implementation.  For
+        ``train_on_inputs=False`` the boundary is recovered by independently
+        encoding the same prompt with an empty ``output`` field — matching
+        official ``generate_and_tokenize_prompt``.
         """
         tok = self._tokenizer
+        eos_id: int | None = getattr(tok, "eos_token_id", None)
 
-        # Build prompt prefix (everything up to and including "### Response:\n").
-        prompt = build_prompt(domain, history_texts, include_response_prefix=True)
-
-        # Build the response suffix: the quoted target title + EOS.
-        response = f'"{target_text}"{tok.eos_token}'
-
-        # Tokenize each part separately so we can compute the boundary length.
-        # Prompts are truncated from the LEFT so that if the history is too long,
-        # old items are dropped while "### Response:\n" is always preserved.
-        # We encode WITHOUT add_special_tokens so BOS is not included in the text
-        # before truncation; BOS is then prepended manually afterwards.  This
-        # ensures BOS survives even when the prompt body fills max_input_length.
-        bos_id: int | None = getattr(tok, "bos_token_id", None)
-        # Reserve one slot for BOS when the tokenizer uses one.
-        prompt_budget: int = (
-            self._config.max_input_length - 1 if bos_id is not None
-            else self._config.max_input_length
+        # Build the two strings the official code encodes:
+        #   full_prompt = "...### Response:\n\"<target>\""
+        #   user_prompt = "...### Response:\n"        (output field empty)
+        full_prompt = build_prompt(
+            domain, history_texts, include_response_prefix=True
+        ) + f'"{target_text}"'
+        user_prompt = build_prompt(
+            domain, history_texts, include_response_prefix=True
         )
+
+        # Left-truncate the full prompt so that if history exceeds the budget,
+        # older items are dropped while "### Response:\n\"<target>\"" is kept.
+        # Encode WITH special tokens so the tokenizer's BOS/EOS behaviour
+        # matches its default (the official code relies on this default).
         orig_truncation_side = getattr(tok, "truncation_side", "right")
         tok.truncation_side = "left"
-        prompt_ids: list[int] = tok.encode(
-            prompt,
-            add_special_tokens=False,
+        input_ids: list[int] = tok.encode(
+            full_prompt,
+            add_special_tokens=True,
             truncation=True,
-            max_length=prompt_budget,
+            max_length=max_length,
         )
-        tok.truncation_side = orig_truncation_side
-        if bos_id is not None:
-            prompt_ids = [bos_id] + prompt_ids
-        response_ids: list[int] = tok.encode(
-            response,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=self._config.max_new_tokens,
-        )
-
-        # LLaMA tokenizers sometimes prepend a spurious space token for
-        # sequences that do not start with a special token.  Remove it.
+        # Append EOS if the tokenizer did not already add one and there is room
+        # (matches official train.py:tokenize add_eos_token=True branch).
         if (
-            len(response_ids) > 0
-            and tok.convert_ids_to_tokens(response_ids[:1]) == ["▁"]
+            eos_id is not None
+            and (len(input_ids) == 0 or input_ids[-1] != eos_id)
+            and len(input_ids) < max_length
         ):
-            response_ids = response_ids[1:]
+            input_ids.append(eos_id)
+        tok.truncation_side = orig_truncation_side
 
-        input_ids: list[int] = (prompt_ids + response_ids)[:max_length]
-        # Apply train_on_inputs supervision mask (official BIGRec default: True).
         if self._config.train_on_inputs:
-            # Full-sequence supervision: identical to the official BIGRec training.
             labels: list[int] = list(input_ids)
         else:
-            # Response-only supervision: mask the prompt portion from loss.
-            prompt_len = min(len(prompt_ids), len(input_ids))
+            # Boundary = length of "user_prompt" tokenized identically (no EOS
+            # appended, matching official add_eos_token=False for the boundary
+            # probe).
+            user_ids: list[int] = tok.encode(
+                user_prompt,
+                add_special_tokens=True,
+                truncation=True,
+                max_length=max_length,
+            )
+            prompt_len = min(len(user_ids), len(input_ids))
             labels = [-100] * prompt_len + input_ids[prompt_len:]
 
         return {"input_ids": input_ids, "labels": labels}
