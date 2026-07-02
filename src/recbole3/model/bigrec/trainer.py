@@ -8,6 +8,7 @@ tests and call sites.
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
 import os
@@ -543,11 +544,37 @@ class BIGRecTrainer:
         # when the pipeline subsequently calls evaluate(), which loads the
         # generation model (~17 GB) plus the base embedding model (~16 GB),
         # pushing total VRAM usage to ~51 GB and causing OOM on a 40 GB A100.
+        #
+        # HF Trainer internally keeps multiple references to the wrapped model
+        # (self.model, self.model_wrapped, self.optimizer.param_groups,
+        # self.lr_scheduler, self.accelerator, self.deepspeed_engine, ...).
+        # Cyclic references between Trainer/optimizer/model mean that plain
+        # `del` alone leaves the objects reachable via the cyclic GC generation
+        # until it runs on its own schedule.  Force a full collection cycle
+        # BEFORE calling empty_cache() so the CUDA allocator sees the tensors
+        # as truly free.
+        try:
+            hf_trainer.model = None            # break Trainer → model ref
+            hf_trainer.model_wrapped = None    # break Trainer → DDP/DP wrapper
+            hf_trainer.optimizer = None        # break Trainer → optimizer → params
+            hf_trainer.lr_scheduler = None
+            hf_trainer.accelerator = None
+            hf_trainer.deepspeed = None
+            hf_trainer.callback_handler = None
+        except AttributeError:
+            # HF Trainer's attribute set differs across versions; ignore missing.
+            pass
         del hf_trainer
         del model
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        self._log("Training model freed from GPU memory.")
+            torch.cuda.ipc_collect()
+        self._log(
+            "Training model freed from GPU memory (allocated=%.2f GB, reserved=%.2f GB).",
+            torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0,
+            torch.cuda.memory_reserved() / 1024**3 if torch.cuda.is_available() else 0.0,
+        )
 
         return {"checkpoint_path": output_dir}
 
@@ -720,7 +747,9 @@ class BIGRecTrainer:
             )
 
         if torch.cuda.is_available():
+            gc.collect()
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
         self._log("vLLM offline generation complete, VRAM reclaimed.")
 
         tokenizer = self._load_tokenizer(padding_side="left")
