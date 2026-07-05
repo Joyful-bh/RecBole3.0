@@ -56,6 +56,12 @@ lc-rec = [
   "flash-attn",
 ]
 
+llamarec = [
+  "bitsandbytes>=0.41",
+  "peft>=0.7",
+  "transformers>=4.40,<5.0",
+]
+
 llmrank = [
   "nltk>=3.8",           # Manually download the required NLTK packages: python -c "import nltk; nltk.download('punkt'); nltk.download('stopwords')"
   "tqdm>=4.60.0",        

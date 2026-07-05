@@ -1,0 +1,10 @@
+name: ml100k_retrieval
+mapping_source: /home/wangxiaolei/xujiale/LlamaRec/data/preprocessed/ml-100k_min_rating0-min_uc5-min_sc5/dataset.pkl
+processed_dir: data/processed
+refresh_cache: false
+split:
+  strategy: leave_one_out
+  order: chronological
+  per_user: true
+  valid_holdout_num: 1
+  test_holdout_num: 1

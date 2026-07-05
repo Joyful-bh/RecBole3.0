@@ -91,6 +91,19 @@ from recbole3.model.rearec import (
     ReaRecModelDataset,
     ReaRecTrainer,
 )
+from recbole3.model.llamarec import (
+    LlamaRecConfig,
+    LlamaRecModel,
+    LlamaRecTrainer,
+    LlamaRecTrainerConfig,
+)
+from recbole3.model.lrurec import (
+    LRURecConfig,
+    LRURecModel,
+    LRURecModelDataset,
+    LRURecTrainer,
+    LRURecTrainerConfig,
+)
 from recbole3.model.minionerec.config import MiniOneRecConfig
 from recbole3.model.rankmixer import (
     RANKMIXER_FEATURES,
@@ -259,6 +272,21 @@ MODEL_TABLE: dict[str, ModelSpec] = {
         trainer_config_cls=LLMRankTrainerConfig,
         pipeline_cls=LazyImport("recbole3.model.llmrank.pipeline", "LLMRankPipeline"),
     ),
+
+    "llamarec": ModelSpec(
+        model_cls=LlamaRecModel,
+        config_cls=LlamaRecConfig,
+        trainer_config_cls=LlamaRecTrainerConfig,
+        pipeline_cls=LazyImport("recbole3.model.llamarec.pipeline", "LlamaRecPipeline"),
+    ),
+    "lrurec": ModelSpec(
+        model_cls=LRURecModel,
+        config_cls=LRURecConfig,
+        model_data_cls=LRURecModelDataset,
+        trainer_cls=LRURecTrainer,
+        trainer_config_cls=LRURecTrainerConfig,
+        pipeline_cls=Pipeline,
+    ),
     "minionerec": ModelSpec(
         model_cls=LazyImport("transformers", "PreTrainedModel"),
         config_cls=MiniOneRecConfig,
@@ -364,6 +392,15 @@ __all__ = [
     "LSRMModelDataset",
     "LLMRankModel",
     "LLMRankModelDataset",
+    "LlamaRecConfig",
+    "LlamaRecModel",
+    "LlamaRecTrainer",
+    "LlamaRecTrainerConfig",
+    "LRURecConfig",
+    "LRURecModel",
+    "LRURecModelDataset",
+    "LRURecTrainer",
+    "LRURecTrainerConfig",
     "MODEL_TABLE",
     "RANKMIXER_FEATURES",
     "RQVAEConfig",

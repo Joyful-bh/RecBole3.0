@@ -186,6 +186,28 @@ class NDCGMetric(BaseRetrievalMetric):
         return results
 
 
+class MRRMetric(BaseRetrievalMetric):
+    """Mean reciprocal rank at K for binary relevance."""
+
+    def __init__(self, ks: tuple[int, ...]) -> None:
+        super().__init__(name="mrr", ks=ks)
+
+    def compute(self, eval_data: RetrievalEvalData) -> dict[str, float]:
+        pred_item_ids, target_item_ids, target_mask = _normalize_retrieval_eval_data(eval_data, self.name)
+        _require_prediction_width(pred_item_ids, max(self.ks), self.name)
+        relevant_count = np.sum(target_mask, axis=1)
+        valid_rows = relevant_count > 0
+        if not np.any(valid_rows):
+            return {f"{self.name}@{k}": 0.0 for k in self.ks}
+
+        results: dict[str, float] = {}
+        for k in self.ks:
+            relevance = _compute_binary_relevance(pred_item_ids[:, :k], target_item_ids, target_mask)
+            reciprocal_ranks = relevance / np.arange(1, k + 1, dtype=np.float64)[None, :]
+            results[f"{self.name}@{k}"] = float(np.mean(np.sum(reciprocal_ranks, axis=1)[valid_rows]))
+        return results
+
+
 def create_builtin_metrics(metric_specs: tuple[MetricSpec, ...], protocol: EvalProtocol) -> list[BaseMetric]:
     """Instantiate built-in metrics for one evaluation protocol."""
 
@@ -214,6 +236,10 @@ def create_builtin_metrics(metric_specs: tuple[MetricSpec, ...], protocol: EvalP
         if metric_name == "ndcg":
             _require_protocol(metric_name, protocol, {"sampled", "full"})
             metrics.append(NDCGMetric(spec.ks))
+            continue
+        if metric_name == "mrr":
+            _require_protocol(metric_name, protocol, {"sampled", "full"})
+            metrics.append(MRRMetric(spec.ks))
             continue
         raise ValueError(f"Unsupported metric '{spec.name}'.")
     return metrics
@@ -340,6 +366,7 @@ __all__ = [
     "LogLossMetric",
     "MetricSpec",
     "NDCGMetric",
+    "MRRMetric",
     "RankingEvalData",
     "RecallMetric",
     "RetrievalEvalData",

@@ -31,6 +31,11 @@ from recbole3.dataset.amazon2023 import (
     Amazon2023RetrievalDataset,
     Amazon2023RetrievalParser,
 )
+from recbole3.dataset.ml100k import (
+    ML100KRetrievalConfig,
+    ML100KRetrievalDataset,
+    ML100KRetrievalParser,
+)
 from recbole3.dataset.base import (
     BaseTaskDataset,
     DatasetTask,
@@ -82,6 +87,10 @@ DATASET_TABLE: dict[str, DatasetSpec] = {
         dataset_cls=Amazon2023RetrievalDataset,
         config_cls=Amazon2023RetrievalConfig,
     ),
+    "ml100k_retrieval": DatasetSpec(
+        dataset_cls=ML100KRetrievalDataset,
+        config_cls=ML100KRetrievalConfig,
+    ),
 }
 
 
@@ -113,6 +122,9 @@ __all__ = [
     "Amazon2023RetrievalConfig",
     "Amazon2023RetrievalDataset",
     "Amazon2023RetrievalParser",
+    "ML100KRetrievalConfig",
+    "ML100KRetrievalDataset",
+    "ML100KRetrievalParser",
     "BaseDatasetParser",
     "BaseTaskDataset",
     "CANDIDATE_ITEM_IDS",

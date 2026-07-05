@@ -1,0 +1,65 @@
+# @package _global_
+
+model:
+  name: llamarec
+  history_max_length: 20
+  candidate_topk: 20
+  retrieved_path: outputs/lrurec_grid/wd0_drop0.2/retrieved.pkl
+  item_text_field: title
+  base_model: /media/public/models/huggingface/Qwen/Qwen2.5-3B
+  tokenizer_path: /media/public/models/huggingface/Qwen/Qwen2.5-3B
+  max_title_tokens: 32
+  max_text_length: 1536
+  auto_stage1: true
+  stage1_output_dir: ""
+  stage1_save_full_score_matrix: false
+  stage1_max_epochs: null
+  stage1_history_max_length: 50
+  negative_sample_size: 19
+  train_on_inputs: false
+  load_in_4bit: true
+  local_files_only: true
+  use_double_quant: true
+  quant_type: nf4
+  lora_r: 8
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: [q_proj, v_proj]
+
+trainer:
+  run_mode: sanity
+  batch_size: 8
+  micro_batch_size: 1
+  eval_batch_size: 8
+  max_epochs: 1
+  learning_rate: 0.0001
+  warmup_steps: 100
+  eval_steps: 100
+  save_steps: 100
+  early_stopping_patience: 20
+  metric_for_best_model: ndcg@10
+  optimizer_name: paged_adamw_32bit
+  logging_steps: 10
+  save_total_limit: 3
+  seed: 42
+  dataloader_num_workers: 4
+  use_external_train_dataloader: true
+  trace_max_steps: 500
+  sanity_train_samples: 3
+  sanity_valid_samples: 3
+  sanity_valid_inference_users: 5
+  sanity_train_steps: 2
+  candidate_topk: 20
+  save_full_score_matrix: false
+  report_to: none
+  eval:
+    protocol: full
+    exclude_history: false
+    neg_sampling_num: 0
+    metrics:
+      - name: recall
+        ks: [1, 5, 10]
+      - name: ndcg
+        ks: [1, 5, 10]
+      - name: mrr
+        ks: [1, 5, 10]
