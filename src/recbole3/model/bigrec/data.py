@@ -170,66 +170,66 @@ def build_item_text_lookup(
     prepared_data: Any,
     config: "BIGRecConfig",
 ) -> list[str]:
-    """Build an indexed list of item text strings from *prepared_data*'s item table.
+    """Build an indexed list of item title strings from *prepared_data*'s item table.
 
-    The returned list has length ``num_items``; entry ``i`` is the text for
-    framework ``item_id == i``.  When a preferred field is absent or empty
-    the fallback field is tried; if still absent the raw item_id is used.
+    The returned list has length ``num_items``; entry ``i`` is the title for
+    framework ``item_id == i``. Missing or empty titles fail fast because BIGRec
+    grounding compares generated title text against item-title embeddings.
 
     Args:
         prepared_data: A prepared ``BaseTaskDataset`` (or ``BIGRecModelDataset``).
-        config: ``BIGRecConfig`` supplying ``item_text_field`` and
-            ``fallback_item_text_field``.
+        config: ``BIGRecConfig`` supplying ``item_text_field``.
 
     Returns:
-        List of item text strings indexed by framework item_id.
+        List of item title strings indexed by framework item_id.
     """
     num_items: int = int(prepared_data.get_num_items())
     item_table: pd.DataFrame = prepared_data.get_item_table()
 
-    # Default placeholder text — will be overwritten for items that have metadata.
-    text_lookup: list[str] = [f"item_{i}" for i in range(num_items)]
-
     primary_col: str = config.item_text_field
-    fallback_col: str | None = config.fallback_item_text_field
+    text_lookup: list[str | None] = [None for _ in range(num_items)]
+    missing_titles: list[int] = []
 
-    if primary_col not in item_table.columns and (
-        fallback_col is None or fallback_col not in item_table.columns
-    ):
-        logger.warning(
-            "BIGRec: item_table has neither column '%s' nor '%s'. "
-            "Using placeholder text for all items.",
-            primary_col,
-            fallback_col,
+    if primary_col not in item_table.columns:
+        available = ", ".join(str(col) for col in item_table.columns)
+        raise ValueError(
+            "BIGRec requires item titles for grounding, but item_table is missing "
+            f"column '{primary_col}'. Use Amazon Reviews 2023 with metadata_mode='fields' "
+            f"so a title column is materialized. Available columns: {available}"
         )
-        return text_lookup
 
     for row in item_table.itertuples(index=False):
         item_id = int(getattr(row, ITEM_ID))
         if not 0 <= item_id < num_items:
             continue
 
-        # Resolve text: primary → fallback → placeholder.
         text: str = ""
-        if primary_col in item_table.columns:
-            raw = getattr(row, primary_col, None)
-            if raw is not None:
-                text = str(raw).strip()
-
-        if not text and fallback_col and fallback_col in item_table.columns:
-            raw = getattr(row, fallback_col, None)
-            if raw is not None:
-                text = str(raw).strip()
-
+        raw = getattr(row, primary_col, None)
+        if raw is not None:
+            text = str(raw).strip()
         if text:
             text_lookup[item_id] = text
+        else:
+            missing_titles.append(item_id)
+
+    unresolved = [idx for idx, text in enumerate(text_lookup) if text is None]
+    if missing_titles or unresolved:
+        missing_count = len(set(missing_titles + unresolved))
+        examples = ", ".join(str(i) for i in (missing_titles or unresolved)[:10])
+        raise ValueError(
+            "BIGRec requires non-empty item titles for every item. "
+            f"Found {missing_count} item(s) without a usable '{primary_col}' value; "
+            f"example item_id(s): {examples}. Use Amazon Reviews 2023 with "
+            "metadata_mode='fields' and verify the raw metadata contains titles "
+            "for all interacted items."
+        )
 
     logger.info(
         "BIGRec: built item text lookup for %d items (field=%s).",
         num_items,
         primary_col,
     )
-    return text_lookup
+    return [str(text) for text in text_lookup]
 
 
 # ---------------------------------------------------------------------------

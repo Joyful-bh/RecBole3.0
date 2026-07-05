@@ -204,6 +204,47 @@ class BIGRecGrounder:
         coarse = tuple(float(i) for i in range(1, 100))
         return fine + coarse
 
+    @staticmethod
+    def _batch_topk_full(dist: torch.Tensor, k: int) -> np.ndarray:
+        """Return smallest-distance item ids for every row without full sorting."""
+        actual_k = min(k, dist.shape[1])
+        top_k = torch.topk(dist, k=actual_k, dim=1, largest=False).indices.cpu().numpy()
+        if actual_k < k:
+            padding = np.full((top_k.shape[0], k - actual_k), -1, dtype=np.int64)
+            top_k = np.concatenate([top_k, padding], axis=1)
+        return top_k.astype(np.int64, copy=False)
+
+    @staticmethod
+    def _sampled_topk_rows(
+        dist: torch.Tensor,
+        cand_lists: list[list[int] | None],
+        k: int,
+        device: torch.device,
+    ) -> np.ndarray:
+        """Return top-k item ids when each row may have a different candidate set."""
+        rows: list[np.ndarray] = []
+        num_items = dist.shape[1]
+
+        for i, cand in enumerate(cand_lists):
+            if cand is None:
+                actual_k = min(k, num_items)
+                top_k = torch.topk(dist[i], k=actual_k, largest=False).indices.cpu().numpy()
+            else:
+                cand_t = torch.tensor(cand, dtype=torch.long, device=device)
+                actual_k = min(k, cand_t.numel())
+                if actual_k == 0:
+                    top_k = np.empty(0, dtype=np.int64)
+                else:
+                    cand_dists = dist[i, cand_t]
+                    top_idx = torch.topk(cand_dists, k=actual_k, largest=False).indices
+                    top_k = cand_t[top_idx].cpu().numpy()
+
+            if len(top_k) < k:
+                top_k = np.concatenate([top_k, np.full(k - len(top_k), -1, dtype=np.int64)])
+            rows.append(top_k.reshape(1, k))
+
+        return np.concatenate(rows, axis=0)
+
     def run_gamma_search(
         self,
         dist: torch.Tensor,
@@ -233,22 +274,15 @@ class BIGRecGrounder:
 
         for gamma in tqdm(gamma_values, desc="Gamma search", disable=not self._is_main_process()):
             eff_dist = self.apply_grounding_weights(dist, grounding_weights, gamma)
-            pred_list: list[np.ndarray] = []
-            for i in range(n):
-                cand = cand_lists[i]
-                if is_sampled and cand is not None:
-                    cand_t = torch.tensor(cand, dtype=torch.long, device=device)
-                    cand_dists = eff_dist[i, cand_t]
-                    top_k = cand_t[torch.argsort(cand_dists)[:maxk]].cpu().numpy()
-                else:
-                    top_k = torch.argsort(eff_dist[i])[:maxk].cpu().numpy()
-                if len(top_k) < maxk:
-                    top_k = np.concatenate([top_k, np.full(maxk - len(top_k), -1, dtype=np.int64)])
-                pred_list.append(top_k.reshape(1, maxk))
+            pred_item_ids = (
+                self._sampled_topk_rows(eff_dist, cand_lists, maxk, device)
+                if is_sampled
+                else self._batch_topk_full(eff_dist, maxk)
+            )
 
             scores = metric_fn(
                 RetrievalEvalData(
-                    pred_item_ids=np.concatenate(pred_list, axis=0),
+                    pred_item_ids=pred_item_ids,
                     target_item_ids=target_arr,
                     target_mask=mask_arr,
                 )
@@ -294,21 +328,14 @@ class BIGRecGrounder:
                     else dist
                 )
 
-                pred_list: list[np.ndarray] = []
-                for i in range(n):
-                    cand = cand_lists[i]
-                    if is_sampled and cand is not None:
-                        cand_t = torch.tensor(cand, dtype=torch.long, device=device)
-                        cand_dists = eff_dist[i, cand_t]
-                        top_k = cand_t[torch.argsort(cand_dists)[:k]].cpu().numpy()
-                    else:
-                        top_k = torch.argsort(eff_dist[i])[:k].cpu().numpy()
-                    if len(top_k) < maxk:
-                        top_k = np.concatenate([top_k, np.full(maxk - len(top_k), -1, dtype=np.int64)])
-                    pred_list.append(top_k.reshape(1, maxk))
+                pred_item_ids = (
+                    self._sampled_topk_rows(eff_dist, cand_lists, maxk, device)
+                    if is_sampled
+                    else self._batch_topk_full(eff_dist, maxk)
+                )
 
                 eval_data = RetrievalEvalData(
-                    pred_item_ids=np.concatenate(pred_list, axis=0),
+                    pred_item_ids=pred_item_ids,
                     target_item_ids=target_arr,
                     target_mask=mask_arr,
                 )
@@ -365,21 +392,15 @@ class BIGRecGrounder:
                 else distances
             )
 
+            batch_pred_item_ids = (
+                self._sampled_topk_rows(effective_dist, batch_cand_lists, maxk, device)
+                if is_sampled
+                else self._batch_topk_full(effective_dist, maxk)
+            )
+
             for i in range(actual_bs):
                 target_id = batch_target_ids[i]
-                if is_sampled:
-                    cand_val = batch_cand_lists[i]
-                    cand_ids_list = list(range(item_emb_device.shape[0])) if cand_val is None else list(cand_val)
-                    cand_tensor = torch.tensor(cand_ids_list, dtype=torch.long, device=device)
-                    cand_dists = effective_dist[i, cand_tensor]
-                    top_k_ids = cand_tensor[torch.argsort(cand_dists)[:maxk]].cpu().numpy()
-                    if len(top_k_ids) < maxk:
-                        top_k_ids = np.concatenate(
-                            [top_k_ids, np.full(maxk - len(top_k_ids), -1, dtype=np.int64)]
-                        )
-                else:
-                    top_k_ids = torch.argsort(effective_dist[i])[:maxk].cpu().numpy()
-
+                top_k_ids = batch_pred_item_ids[i]
                 all_pred_item_ids.append(top_k_ids.reshape(1, maxk))
                 all_target_item_ids.append(np.array([[target_id]], dtype=np.int64))
                 all_target_masks.append(np.array([[True]], dtype=bool))

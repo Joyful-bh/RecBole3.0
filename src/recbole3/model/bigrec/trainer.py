@@ -9,6 +9,7 @@ tests and call sites.
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import math
 import os
@@ -622,6 +623,49 @@ class BIGRecTrainer:
             eval_frame, item_text_lookup, checkpoint_path, work_dir
         )
 
+    def _write_generation_debug_sample(
+        self,
+        generated_texts: list[str],
+        target_ids: list[int],
+        item_text_lookup: list[str],
+        checkpoint_path: str,
+        split: str,
+        sample_size: int = 20,
+    ) -> None:
+        """Write a small random sample of raw LLM generations for inspection."""
+        if not self._is_main_process() or not generated_texts:
+            return
+
+        n = min(sample_size, len(generated_texts))
+        sample_indices = (
+            pd.Series(range(len(generated_texts)))
+            .sample(n=n, random_state=42)
+            .astype(int)
+            .tolist()
+        )
+        rows: list[dict[str, Any]] = []
+        for index in sample_indices:
+            target_id = int(target_ids[index])
+            target_title = (
+                item_text_lookup[target_id]
+                if 0 <= target_id < len(item_text_lookup)
+                else f"[invalid_target_id:{target_id}]"
+            )
+            rows.append(
+                {
+                    "row_index": index,
+                    "generated_text": generated_texts[index],
+                    "target_item_id": target_id,
+                    "target_title": target_title,
+                }
+            )
+
+        os.makedirs(checkpoint_path, exist_ok=True)
+        debug_path = os.path.join(checkpoint_path, f"bigrec_generation_debug_{split}.json")
+        with open(debug_path, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+        self._log("Wrote BIGRec generation debug sample to %s", debug_path)
+
     def _run_gamma_search(
         self,
         dist: torch.Tensor,
@@ -733,6 +777,13 @@ class BIGRecTrainer:
 
         eval_texts, target_ids, cand_lists = self._generate_all_titles_vllm(
             eval_frame, item_text_lookup, checkpoint_path, gen_work_dir,
+        )
+        self._write_generation_debug_sample(
+            eval_texts,
+            target_ids,
+            item_text_lookup,
+            checkpoint_path,
+            split,
         )
 
         if self.config.grounding_gamma_search:

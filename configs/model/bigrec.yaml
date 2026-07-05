@@ -57,11 +57,10 @@ model:
   # ── Embedding Grounding ──────────────────────────────────────────────────────
   history_max_length: 20                # most-recent history items in the prompt
   item_text_field: title                # item_table column for item name text
-  fallback_item_text_field: metadata_text
   domain: product                       # "movie", "product", or "item"
   embedding_batch_size: 32
   embedding_cache_dir: outputs/bigrec/embeddings
-  refresh_embedding_cache: false
+  refresh_embedding_cache: true
   embedding_use_base_model: true        # use base (non-LoRA) model for embeddings
 
   # ── Grounding Weight Injection (Eq. 3) ───────────────────────────────────────
@@ -89,8 +88,8 @@ model:
   # vLLM lives in a different conda env from the training environment.
   vllm_conda_env: "vllm"                    # conda env name with vLLM; empty = current env
   vllm_device_id: 8                     # starting GPU index for the vLLM subprocess
-  vllm_tensor_parallel_size: 1          # number of GPUs for vLLM tensor parallelism (>1 for large models)
-  vllm_gpu_memory_utilization: 0.9      # fraction of GPU VRAM vLLM pre-allocates; lower if OOM on startup
+  vllm_tensor_parallel_size: 2          # number of GPUs for vLLM tensor parallelism (>1 for large models)
+  vllm_gpu_memory_utilization: 0.8      # fraction of GPU VRAM vLLM pre-allocates; lower if OOM on startup
 
   # ── Pipeline Control ─────────────────────────────────────────────────────────
   pipeline_stage: training              # "training" or "evaluation"

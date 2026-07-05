@@ -245,10 +245,6 @@ class BIGRecConfig(SequentialModelConfig):
         default="title",
         metadata={"help": "Column in item_table used as the natural-language item name in prompts."},
     )
-    fallback_item_text_field: str | None = field(
-        default="metadata_text",
-        metadata={"help": "Fallback item_table column used when item_text_field is absent or empty."},
-    )
     domain: str = field(
         default="product",
         metadata={

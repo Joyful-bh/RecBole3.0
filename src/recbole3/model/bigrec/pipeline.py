@@ -69,6 +69,18 @@ class BIGRecPipeline(Pipeline):
 
         # ── Dataset ────────────────────────────────────────────────────────────
         dataset_name = require_component_name(dataset_cfg, "dataset")
+        if dataset_name != "amazon2023_retrieval":
+            raise ValueError(
+                "BIGRec currently requires Amazon Reviews 2023 retrieval data "
+                "because grounding is title-only. Use dataset=amazon2023_retrieval "
+                f"with metadata_mode='fields'; got dataset={dataset_name!r}."
+            )
+        metadata_mode = str(dataset_cfg.get("metadata_mode", "")).strip()
+        if metadata_mode != "fields":
+            raise ValueError(
+                "BIGRec requires Amazon Reviews 2023 with metadata_mode='fields' "
+                f"so item titles are available; got metadata_mode={metadata_mode!r}."
+            )
         dataset_spec = get_dataset_spec(dataset_name)
 
         bigrec_config: BIGRecConfig = instantiate_dataclass(BIGRecConfig, model_cfg)

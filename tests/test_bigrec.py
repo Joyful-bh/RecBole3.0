@@ -444,29 +444,21 @@ class TestBuildItemTextLookup:
         # StubParser uses "title" column with values like "Alpha Quest".
         assert any("Quest" in s or "Tales" in s for s in lookup)
 
-    def test_lookup_falls_back_to_metadata_text(self) -> None:
-        """When title field is absent, fallback_item_text_field is used."""
+    def test_lookup_requires_title_column(self) -> None:
         data, _ = _prepare_bigrec_data()
-        cfg = BIGRecConfig(
-            item_text_field="nonexistent_column",
-            fallback_item_text_field="metadata_text",
-        )
-        lookup = build_item_text_lookup(data, cfg)
-        # metadata_text is same as title in StubParser.
-        assert any("Quest" in s or "Tales" in s for s in lookup)
+        cfg = BIGRecConfig(item_text_field="nonexistent_column")
+        with pytest.raises(ValueError, match="missing column 'nonexistent_column'"):
+            build_item_text_lookup(data, cfg)
 
-    def test_lookup_uses_placeholder_when_no_column_exists(self) -> None:
+    def test_lookup_rejects_empty_titles(self) -> None:
         data, _ = _prepare_bigrec_data()
-        cfg = BIGRecConfig(
-            item_text_field="absent_col",
-            fallback_item_text_field=None,
-        )
-        lookup = build_item_text_lookup(data, cfg)
-        # Should be all placeholders like "item_0", "item_1", …
-        assert all(s.startswith("item_") for s in lookup)
+        cfg = BIGRecConfig(item_text_field="title")
+        data._item_table.loc[data._item_table[ITEM_ID] == 0, "title"] = ""
+        with pytest.raises(ValueError, match="non-empty item titles"):
+            build_item_text_lookup(data, cfg)
 
-    def test_lookup_item0_is_placeholder_or_title(self) -> None:
-        """item_id 0 is either a real title or the 'item_0' placeholder."""
+    def test_lookup_item0_is_title(self) -> None:
+        """item_id 0 must resolve to a real title."""
         data, cfg = _prepare_bigrec_data()
         lookup = build_item_text_lookup(data, cfg)
         assert isinstance(lookup[0], str) and len(lookup[0]) > 0
