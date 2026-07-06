@@ -249,10 +249,68 @@ class BIGRecModelDataset(BaseSequentialModelDataset):
     and by ``BIGRecTrainer._evaluate_split()`` (inference prompt construction).
     """
 
-    # Inherits _build_model_datasets from BaseSequentialModelDataset.
-    # Override _include_target_item_in_history here if domain-specific logic
-    # is needed (e.g., exclude negative interactions from history for certain
-    # datasets).  The base-class default keeps only positive / unlabeled items.
+    def _build_model_datasets(self, *, model_config: Any):
+        """Filter untitled items, then inject sequential histories.
+
+        BIGRec uses item titles as the only natural-language item identity in
+        both SFT targets and embedding grounding. Items without usable titles
+        are removed together with their interactions; remaining item ids are
+        compacted before RecBole3 rebuilds train/valid/test splits.
+        """
+        self._filter_items_without_titles(model_config=model_config)
+        return super()._build_model_datasets(model_config=model_config)
+
+    def _filter_items_without_titles(self, *, model_config: Any) -> None:
+        title_col = str(getattr(model_config, "item_text_field", "title"))
+        item_table = self._item_table.copy()
+        if title_col not in item_table.columns:
+            available = ", ".join(str(col) for col in item_table.columns)
+            raise ValueError(
+                "BIGRec requires item titles before model-data construction, "
+                f"but item_table is missing column '{title_col}'. Available columns: {available}"
+            )
+
+        title_values = item_table[title_col].map(self._normalize_title_value)
+        keep_mask = title_values != ""
+        dropped_item_count = int((~keep_mask).sum())
+        if dropped_item_count == 0:
+            return
+
+        kept_item_table = item_table.loc[keep_mask].copy()
+        old_item_ids = kept_item_table[ITEM_ID].astype("int64").tolist()
+        item_id_map = {old_id: new_id for new_id, old_id in enumerate(old_item_ids)}
+
+        original_interaction_count = len(self._interactions)
+        filtered_interactions = self._interactions.loc[
+            self._interactions[ITEM_ID].isin(item_id_map)
+        ].copy()
+        dropped_interaction_count = original_interaction_count - len(filtered_interactions)
+
+        kept_item_table[ITEM_ID] = kept_item_table[ITEM_ID].map(item_id_map).astype("int64")
+        filtered_interactions[ITEM_ID] = (
+            filtered_interactions[ITEM_ID].map(item_id_map).astype("int64")
+        )
+
+        self._item_table = kept_item_table.reset_index(drop=True)
+        self._num_items = int(len(self._item_table))
+        self._interactions = filtered_interactions.reset_index(drop=True)
+        self._build_prepared_datasets()
+
+        logger.warning(
+            "BIGRec: filtered %d item(s) without non-empty '%s' and %d related interaction(s); "
+            "%d item(s) and %d interaction(s) remain.",
+            dropped_item_count,
+            title_col,
+            dropped_interaction_count,
+            self._num_items,
+            len(self._interactions),
+        )
+
+    @staticmethod
+    def _normalize_title_value(value: Any) -> str:
+        if value is None or pd.isna(value):
+            return ""
+        return str(value).strip()
 
 
 # ---------------------------------------------------------------------------

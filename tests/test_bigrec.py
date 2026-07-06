@@ -425,6 +425,35 @@ class TestBIGRecModelDataset:
         assert data.get_num_items() > 0
         assert not data.get_item_table().empty
 
+    def test_items_without_title_are_filtered_and_item_ids_compacted(self) -> None:
+        prepared = StubDataset(StubDatasetConfig()).prepare(
+            eval_config=EvalConfig(protocol="full")
+        )
+        prepared._item_table.loc[prepared._item_table[ITEM_ID] == 1, "title"] = ""
+        prepared._item_table.loc[prepared._item_table[ITEM_ID] == 6, "title"] = None
+
+        cfg = BIGRecConfig(eval_protocol="full")
+        data = BIGRecModelDataset.from_task_dataset(prepared, model_config=cfg)
+
+        item_table = data.get_item_table()
+        assert data.get_num_items() == 6
+        assert item_table[ITEM_ID].tolist() == list(range(6))
+        assert "Bravo Tales" not in set(item_table["title"])
+        assert "Harbor Night" not in set(item_table["title"])
+        assert item_table["title"].map(lambda value: isinstance(value, str) and bool(value.strip())).all()
+
+        for frame in (
+            data.get_interactions(),
+            data.get_train_dataset().frame,
+            data.get_eval_dataset("valid").frame,
+            data.get_eval_dataset("test").frame,
+        ):
+            if not frame.empty:
+                assert int(frame[ITEM_ID].max()) < data.get_num_items()
+
+        lookup = build_item_text_lookup(data, cfg)
+        assert len(lookup) == data.get_num_items()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. build_item_text_lookup
