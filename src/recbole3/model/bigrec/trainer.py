@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+from importlib.util import find_spec
 from typing import Any, Literal
 
 import pandas as pd
@@ -165,7 +166,22 @@ class BIGRecTrainer:
             "device_map": device_map,
         }
         if self.config.load_in_8bit:
-            load_kwargs["load_in_8bit"] = True
+            if find_spec("bitsandbytes") is None:
+                raise ImportError(
+                    "BIGRecConfig.load_in_8bit=True requires bitsandbytes. "
+                    "Install a CUDA-compatible bitsandbytes build in the training "
+                    "environment, or set load_in_8bit=False."
+                )
+            try:
+                from transformers import BitsAndBytesConfig
+            except ImportError as exc:
+                raise ImportError(
+                    "BIGRecConfig.load_in_8bit=True requires a Transformers version "
+                    "that provides BitsAndBytesConfig. Please upgrade transformers "
+                    "or set load_in_8bit=False."
+                ) from exc
+
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
 
         # Distribute model evenly across visible GPUs (~90% of each GPU's memory).
         if device_map == "auto" and torch.cuda.is_available():

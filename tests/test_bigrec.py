@@ -1293,6 +1293,56 @@ class TestTrainerUtility:
         device_map = BIGRecTrainer(BIGRecConfig(device_id=0))._get_device_map()
         assert device_map == {"": 0}
 
+    def test_load_model_uses_bitsandbytes_quantization_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """load_in_8bit must use Transformers' quantization_config API."""
+        import transformers
+
+        captured: dict[str, Any] = {}
+
+        class FakeBitsAndBytesConfig:
+            def __init__(self, **kwargs: Any) -> None:
+                self.kwargs = kwargs
+
+        fake_model = _FakeModel()
+        fake_model.config = MagicMock()
+
+        def fake_from_pretrained(path: str, **kwargs: Any) -> _FakeModel:
+            captured["path"] = path
+            captured.update(kwargs)
+            return fake_model
+
+        monkeypatch.setattr(
+            "recbole3.model.bigrec.trainer.find_spec",
+            lambda name: object() if name == "bitsandbytes" else None,
+        )
+        monkeypatch.setattr(
+            transformers, "BitsAndBytesConfig", FakeBitsAndBytesConfig, raising=False
+        )
+        monkeypatch.setattr(
+            "recbole3.model.bigrec.trainer.AutoModelForCausalLM.from_pretrained",
+            fake_from_pretrained,
+        )
+
+        cfg = BIGRecConfig(load_in_8bit=True, use_lora=False)
+        model = BIGRecTrainer(cfg)._load_model({"": 0})
+
+        assert model is fake_model
+        assert "load_in_8bit" not in captured
+        assert isinstance(captured["quantization_config"], FakeBitsAndBytesConfig)
+        assert captured["quantization_config"].kwargs == {"load_in_8bit": True}
+
+    def test_load_model_8bit_missing_bitsandbytes_has_clear_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing bitsandbytes should fail before Transformers internals."""
+        monkeypatch.setattr("recbole3.model.bigrec.trainer.find_spec", lambda name: None)
+
+        cfg = BIGRecConfig(load_in_8bit=True, use_lora=False)
+        with pytest.raises(ImportError, match="requires bitsandbytes"):
+            BIGRecTrainer(cfg)._load_model({"": 0})
+
     def test_get_device_map_always_returns_logical_zero_in_single_process(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
