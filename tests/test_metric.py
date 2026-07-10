@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from recbole3.evaluation import AUCMetric, GAUCMetric, NDCGMetric, RankingEvalData, RecallMetric, RetrievalEvalData
+from recbole3.evaluation import AUCMetric, GAUCMetric, MRRMetric, NDCGMetric, RankingEvalData, RecallMetric, RetrievalEvalData
 
 
 
@@ -91,3 +91,16 @@ def test_retrieval_metrics_require_matching_target_shapes() -> None:
 
     with pytest.raises(ValueError, match="matching shapes"):
         RecallMetric((1,)).compute(eval_data)
+
+
+def test_mrr_uses_first_relevant_rank_for_single_target_rows() -> None:
+    eval_data = RetrievalEvalData(
+        pred_item_ids=np.array([[1, 2, 3], [4, 5, 6]]),
+        target_item_ids=np.array([[2], [9]]),
+        target_mask=np.array([[True], [True]]),
+    )
+
+    assert MRRMetric((1, 3)).compute(eval_data) == {
+        "mrr@1": 0.0,
+        "mrr@3": 0.25,
+    }

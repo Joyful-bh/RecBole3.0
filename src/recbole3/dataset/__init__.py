@@ -7,6 +7,16 @@ from recbole3.dataset.avazu import (
     AvazuCTRDataset,
     AvazuCTRParser,
 )
+from recbole3.dataset.agentcf import (
+    AgentCFDatasetConfig,
+    AgentCFDataset,
+    AgentCFDatasetParser,
+)
+from recbole3.dataset.agentcfpp_cross import (
+    AgentCFPPCrossConfig,
+    AgentCFPPCrossDataset,
+    AgentCFPPCrossParser,
+)
 from recbole3.dataset.amazon2014 import (
     Amazon2014BaseConfig,
     Amazon2014BaseParser,
@@ -20,6 +30,11 @@ from recbole3.dataset.amazon2023 import (
     Amazon2023RetrievalConfig,
     Amazon2023RetrievalDataset,
     Amazon2023RetrievalParser,
+)
+from recbole3.dataset.ml100k import (
+    ML100KRetrievalConfig,
+    ML100KRetrievalDataset,
+    ML100KRetrievalParser,
 )
 from recbole3.dataset.base import (
     BaseTaskDataset,
@@ -56,6 +71,14 @@ DATASET_TABLE: dict[str, DatasetSpec] = {
         dataset_cls=AvazuCTRDataset,
         config_cls=AvazuCTRConfig,
     ),
+    "agentcf": DatasetSpec(
+        dataset_cls=AgentCFDataset,
+        config_cls=AgentCFDatasetConfig,
+    ),
+    "agentcfpp_cross": DatasetSpec(
+        dataset_cls=AgentCFPPCrossDataset,
+        config_cls=AgentCFPPCrossConfig,
+    ),
     "amazon2014_retrieval": DatasetSpec(
         dataset_cls=Amazon2014RetrievalDataset,
         config_cls=Amazon2014RetrievalConfig,
@@ -63,6 +86,10 @@ DATASET_TABLE: dict[str, DatasetSpec] = {
     "amazon2023_retrieval": DatasetSpec(
         dataset_cls=Amazon2023RetrievalDataset,
         config_cls=Amazon2023RetrievalConfig,
+    ),
+    "ml100k_retrieval": DatasetSpec(
+        dataset_cls=ML100KRetrievalDataset,
+        config_cls=ML100KRetrievalConfig,
     ),
 }
 
@@ -76,6 +103,12 @@ def get_dataset_spec(name: str) -> DatasetSpec:
 
 
 __all__ = [
+    "AgentCFDatasetConfig",
+    "AgentCFDataset",
+    "AgentCFDatasetParser",
+    "AgentCFPPCrossConfig",
+    "AgentCFPPCrossDataset",
+    "AgentCFPPCrossParser",
     "AvazuCTRConfig",
     "AvazuCTRDataset",
     "AvazuCTRParser",
@@ -89,6 +122,9 @@ __all__ = [
     "Amazon2023RetrievalConfig",
     "Amazon2023RetrievalDataset",
     "Amazon2023RetrievalParser",
+    "ML100KRetrievalConfig",
+    "ML100KRetrievalDataset",
+    "ML100KRetrievalParser",
     "BaseDatasetParser",
     "BaseTaskDataset",
     "CANDIDATE_ITEM_IDS",

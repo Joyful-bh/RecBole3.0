@@ -1,0 +1,51 @@
+# @package _global_
+
+model:
+  name: lrurec
+  history_max_length: 200
+  hidden_size: 64
+  num_blocks: 2
+  dropout: 0.4
+  attention_dropout: 0.4
+  sliding_window_size: 1.0
+  initializer_std: 0.02
+  r_min: 0.8
+  r_max: 0.99
+
+trainer:
+  batch_size: 16
+  shuffle: true
+  dataloader_num_workers: 0
+  pin_memory: true
+  mixed_precision: "no"
+  max_epochs: 500
+  validation_interval_steps: 500
+  seed: 42
+  max_grad_norm: 5.0
+  candidate_filename: retrieved.pkl
+  candidate_topk: 20
+  save_full_score_matrix: true
+  monitor: recall@10
+  early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.0
+  checkpoint:
+    save_best: true
+    save_last: true
+  optimizer:
+    name: AdamW
+    kwargs:
+      lr: 0.001
+      weight_decay: 0.01
+      eps: 1.0e-9
+  eval:
+    protocol: full
+    exclude_history: true
+    metrics:
+      - name: recall
+        ks: [1, 5, 10, 20, 50]
+      - name: ndcg
+        ks: [1, 5, 10, 20, 50]
+      - name: mrr
+        ks: [1, 5, 10, 20, 50]

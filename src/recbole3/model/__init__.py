@@ -25,6 +25,13 @@ from recbole3.model.e4srec import (
     E4SRecModelDataset,
     E4SRecTrainer,
 )
+from recbole3.model.etegrec import (
+    ETEGRecConfig,
+    ETEGRecModel,
+    ETEGRecModelDataset,
+    ETEGRecTrainer,
+    ETEGRecTrainerConfig,
+)
 from recbole3.model.lares import (
     LARESConfig,
     LARESModel,
@@ -48,6 +55,30 @@ from recbole3.model.llm4rs import (
     LLM4RSModel,
     LLM4RSModelDataset,
 )
+from recbole3.model.agentcf import (
+    AgentCFConfig,
+    AgentCFModel,
+    AgentCFModelDataset,
+    AgentCFTrainer,
+    AgentCFTrainerConfig,
+)
+from recbole3.model.agentcfpp import (
+    AgentCFPPConfig,
+    AgentCFPPModel,
+    AgentCFPPModelDataset,
+    AgentCFPPTrainer,
+    AgentCFPPTrainerConfig,
+)
+from recbole3.model.care import (
+    CAREConfig,
+    CAREEvalCollator,
+    CAREModel,
+    CAREModelDataset,
+    CARETokenCodec,
+    CARETrainCollator,
+    CARETrainer,
+    CARETrainerConfig,
+)
 from recbole3.model.llm4rs.trainer import LLM4RSTrainer, LLM4RSTrainerConfig
 from recbole3.model.llmrank import (
     LLMRankConfig,
@@ -55,12 +86,24 @@ from recbole3.model.llmrank import (
     LLMRankModelDataset,
 )
 from recbole3.model.llmrank.trainer import LLMRankTrainer, LLMRankTrainerConfig
-
 from recbole3.model.rearec import (
     ReaRecConfig,
     ReaRecModel,
     ReaRecModelDataset,
     ReaRecTrainer,
+)
+from recbole3.model.llamarec import (
+    LlamaRecConfig,
+    LlamaRecModel,
+    LlamaRecTrainer,
+    LlamaRecTrainerConfig,
+)
+from recbole3.model.lrurec import (
+    LRURecConfig,
+    LRURecModel,
+    LRURecModelDataset,
+    LRURecTrainer,
+    LRURecTrainerConfig,
 )
 from recbole3.model.minionerec.config import MiniOneRecConfig
 from recbole3.model.rankmixer import (
@@ -83,6 +126,13 @@ from recbole3.model.rqvae import (
     RQVAEModel,
     RQVAEModelDataset,
     RQVAETrainer,
+)
+from recbole3.model.starec import (
+    STARecConfig,
+    STARecModel,
+    STARecModelDataset,
+    STARecTrainer,
+    STARecTrainerConfig,
 )
 from recbole3.model.tiger import (
     TIGERConfig,
@@ -118,6 +168,29 @@ MODEL_TABLE: dict[str, ModelSpec] = {
         model_cls=LazyImport("transformers", "PreTrainedModel"),
         config_cls=BIGRecConfig,
         pipeline_cls=LazyImport("recbole3.model.bigrec.pipeline", "BIGRecPipeline"),
+    "agentcf": ModelSpec(
+        model_cls=AgentCFModel,
+        config_cls=AgentCFConfig,
+        model_data_cls=AgentCFModelDataset,
+        trainer_cls=AgentCFTrainer,
+        trainer_config_cls=AgentCFTrainerConfig,
+        pipeline_cls=LazyImport("recbole3.model.agentcf.pipeline", "AgentCFPipeline"),
+    ),
+    "agentcfpp": ModelSpec(
+        model_cls=AgentCFPPModel,
+        config_cls=AgentCFPPConfig,
+        model_data_cls=AgentCFPPModelDataset,
+        trainer_cls=AgentCFPPTrainer,
+        trainer_config_cls=AgentCFPPTrainerConfig,
+        pipeline_cls=LazyImport("recbole3.model.agentcfpp.pipeline", "AgentCFPPPipeline"),
+    ),
+    "care": ModelSpec(
+        model_cls=CAREModel,
+        config_cls=CAREConfig,
+        model_data_cls=CAREModelDataset,
+        trainer_cls=CARETrainer,
+        trainer_config_cls=CARETrainerConfig,
+        pipeline_cls=Pipeline,
     ),
     "rearec": ModelSpec(
         model_cls=ReaRecModel,
@@ -141,6 +214,14 @@ MODEL_TABLE: dict[str, ModelSpec] = {
         model_data_cls=E4SRecModelDataset,
         trainer_cls=E4SRecTrainer,
         trainer_config_cls=TrainerConfig,
+        pipeline_cls=Pipeline,
+    ),
+    "etegrec": ModelSpec(
+        model_cls=ETEGRecModel,
+        config_cls=ETEGRecConfig,
+        model_data_cls=ETEGRecModelDataset,
+        trainer_cls=ETEGRecTrainer,
+        trainer_config_cls=ETEGRecTrainerConfig,
         pipeline_cls=Pipeline,
     ),
     "lares": ModelSpec(
@@ -196,6 +277,21 @@ MODEL_TABLE: dict[str, ModelSpec] = {
         trainer_config_cls=LLMRankTrainerConfig,
         pipeline_cls=LazyImport("recbole3.model.llmrank.pipeline", "LLMRankPipeline"),
     ),
+
+    "llamarec": ModelSpec(
+        model_cls=LlamaRecModel,
+        config_cls=LlamaRecConfig,
+        trainer_config_cls=LlamaRecTrainerConfig,
+        pipeline_cls=LazyImport("recbole3.model.llamarec.pipeline", "LlamaRecPipeline"),
+    ),
+    "lrurec": ModelSpec(
+        model_cls=LRURecModel,
+        config_cls=LRURecConfig,
+        model_data_cls=LRURecModelDataset,
+        trainer_cls=LRURecTrainer,
+        trainer_config_cls=LRURecTrainerConfig,
+        pipeline_cls=Pipeline,
+    ),
     "minionerec": ModelSpec(
         model_cls=LazyImport("transformers", "PreTrainedModel"),
         config_cls=MiniOneRecConfig,
@@ -215,6 +311,14 @@ MODEL_TABLE: dict[str, ModelSpec] = {
         trainer_cls=RPGTrainer,
         trainer_config_cls=RPGTrainerConfig,
         pipeline_cls=Pipeline,
+    ),
+    "starec": ModelSpec(
+        model_cls=STARecModel,
+        config_cls=STARecConfig,
+        model_data_cls=STARecModelDataset,
+        trainer_cls=STARecTrainer,
+        trainer_config_cls=STARecTrainerConfig,
+        pipeline_cls=LazyImport("recbole3.model.starec.pipeline", "STARecPipeline"),
     ),
     "tiger": ModelSpec(
         model_cls=TIGERModel,
@@ -236,6 +340,16 @@ def get_model_spec(name: str) -> ModelSpec:
 
 
 __all__ = [
+    "AgentCFConfig",
+    "AgentCFModel",
+    "AgentCFModelDataset",
+    "AgentCFTrainer",
+    "AgentCFTrainerConfig",
+    "AgentCFPPConfig",
+    "AgentCFPPModel",
+    "AgentCFPPModelDataset",
+    "AgentCFPPTrainer",
+    "AgentCFPPTrainerConfig",
     "BaseCollator",
     "BIGRecConfig",
     "ReaRecConfig",
@@ -247,10 +361,23 @@ __all__ = [
     "BaseRankingModel",
     "BaseRetrievalModel",
     "BaseSequentialModelDataset",
+    "CAREConfig",
+    "CAREEvalCollator",
+    "CAREModel",
+    "CAREModelDataset",
+    "CARETokenCodec",
+    "CARETrainCollator",
+    "CARETrainer",
+    "CARETrainerConfig",
     "E4SRecConfig",
     "E4SRecModel",
     "E4SRecModelDataset",
     "E4SRecTrainer",
+    "ETEGRecConfig",
+    "ETEGRecModel",
+    "ETEGRecModelDataset",
+    "ETEGRecTrainer",
+    "ETEGRecTrainerConfig",
     "HISTORY_ITEM_IDS",
     "HISTORY_TIMESTAMPS",
     "HSTUConfig",
@@ -271,6 +398,15 @@ __all__ = [
     "LSRMModelDataset",
     "LLMRankModel",
     "LLMRankModelDataset",
+    "LlamaRecConfig",
+    "LlamaRecModel",
+    "LlamaRecTrainer",
+    "LlamaRecTrainerConfig",
+    "LRURecConfig",
+    "LRURecModel",
+    "LRURecModelDataset",
+    "LRURecTrainer",
+    "LRURecTrainerConfig",
     "MODEL_TABLE",
     "RANKMIXER_FEATURES",
     "RQVAEConfig",
@@ -287,6 +423,11 @@ __all__ = [
     "RankMixerPipeline",
     "RankMixerTrainCollator",
     "SequentialModelConfig",
+    "STARecConfig",
+    "STARecModel",
+    "STARecModelDataset",
+    "STARecTrainer",
+    "STARecTrainerConfig",
     "TIGERConfig",
     "TIGERModel",
     "TIGERModelDataset",
