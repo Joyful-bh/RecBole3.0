@@ -91,7 +91,10 @@ class BIGRecPipeline(Pipeline):
         # NOTE: this step can take several minutes on large datasets (k-core
         # filtering, interaction splitting, item-table construction).
         logger.info("BIGRec [1/2]: preparing dataset '%s' …", dataset_name)
-        eval_config = EvalConfig(protocol=bigrec_config.eval_protocol)  # type: ignore[arg-type]
+        eval_config = EvalConfig(
+            protocol=bigrec_config.eval_protocol,  # type: ignore[arg-type]
+            exclude_history=bigrec_config.exclude_history,
+        )
         task_data = dataset_spec.dataset_cls(
             instantiate_dataclass(dataset_spec.config_cls, dataset_cfg)
         ).prepare(eval_config=eval_config)

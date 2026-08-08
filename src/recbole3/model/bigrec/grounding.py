@@ -208,11 +208,50 @@ class BIGRecGrounder:
     def _batch_topk_full(dist: torch.Tensor, k: int) -> np.ndarray:
         """Return smallest-distance item ids for every row without full sorting."""
         actual_k = min(k, dist.shape[1])
-        top_k = torch.topk(dist, k=actual_k, dim=1, largest=False).indices.cpu().numpy()
+        top_values, top_indices = torch.topk(dist, k=actual_k, dim=1, largest=False)
+        top_indices = top_indices.masked_fill(~torch.isfinite(top_values), -1)
+        top_k = top_indices.cpu().numpy()
         if actual_k < k:
             padding = np.full((top_k.shape[0], k - actual_k), -1, dtype=np.int64)
             top_k = np.concatenate([top_k, padding], axis=1)
         return top_k.astype(np.int64, copy=False)
+
+    def mask_history_items(
+        self,
+        dist: torch.Tensor,
+        excluded_item_ids: list[list[int]] | None,
+    ) -> torch.Tensor:
+        """Set seen-item distances to infinity for full-ranking evaluation."""
+        if (
+            not self.config.exclude_history
+            or self.config.eval_protocol != "full"
+            or excluded_item_ids is None
+        ):
+            return dist
+        if len(excluded_item_ids) != dist.shape[0]:
+            raise ValueError(
+                "BIGRec history exclusion row count does not match distance matrix: "
+                f"{len(excluded_item_ids)} != {dist.shape[0]}."
+            )
+
+        row_indices: list[int] = []
+        item_indices: list[int] = []
+        num_items = int(dist.shape[1])
+        for row_index, item_ids in enumerate(excluded_item_ids):
+            for item_id in item_ids:
+                normalized_item_id = int(item_id)
+                if 0 <= normalized_item_id < num_items:
+                    row_indices.append(row_index)
+                    item_indices.append(normalized_item_id)
+        if not row_indices:
+            return dist
+
+        masked = dist.clone()
+        masked[
+            torch.tensor(row_indices, dtype=torch.long, device=dist.device),
+            torch.tensor(item_indices, dtype=torch.long, device=dist.device),
+        ] = float("inf")
+        return masked
 
     @staticmethod
     def _sampled_topk_rows(
@@ -253,6 +292,7 @@ class BIGRecGrounder:
         cand_lists: list[list[int] | None],
         device: torch.device,
         gamma_values: tuple[float, ...],
+        excluded_item_ids: list[list[int]] | None = None,
         *,
         compute_metrics: MetricFn | None = None,
     ) -> dict[str, float]:
@@ -274,6 +314,7 @@ class BIGRecGrounder:
 
         for gamma in tqdm(gamma_values, desc="Gamma search", disable=not self._is_main_process()):
             eff_dist = self.apply_grounding_weights(dist, grounding_weights, gamma)
+            eff_dist = self.mask_history_items(eff_dist, excluded_item_ids)
             pred_item_ids = (
                 self._sampled_topk_rows(eff_dist, cand_lists, maxk, device)
                 if is_sampled
@@ -305,6 +346,7 @@ class BIGRecGrounder:
         cand_lists: list[list[int] | None],
         best_gammas: dict[str, float],
         device: torch.device,
+        excluded_item_ids: list[list[int]] | None = None,
     ) -> dict[str, float]:
         """Evaluate with independently selected gamma values per metric@K."""
         maxk = max(self.config.eval_topk)
@@ -327,6 +369,7 @@ class BIGRecGrounder:
                     if grounding_weights is not None
                     else dist
                 )
+                eff_dist = self.mask_history_items(eff_dist, excluded_item_ids)
 
                 pred_item_ids = (
                     self._sampled_topk_rows(eff_dist, cand_lists, maxk, device)
@@ -356,6 +399,7 @@ class BIGRecGrounder:
         cand_lists: list[list[int] | None],
         grounding_weights: torch.Tensor | None,
         device: torch.device,
+        excluded_item_ids: list[list[int]] | None = None,
         *,
         extract_embeddings: ExtractEmbeddingsFn | None = None,
         compute_metrics: MetricFn | None = None,
@@ -390,6 +434,15 @@ class BIGRecGrounder:
                 self.apply_grounding_weights(distances, weights_device, self.config.grounding_gamma)
                 if weights_device is not None
                 else distances
+            )
+            batch_excluded_item_ids = (
+                excluded_item_ids[start : start + actual_bs]
+                if excluded_item_ids is not None
+                else None
+            )
+            effective_dist = self.mask_history_items(
+                effective_dist,
+                batch_excluded_item_ids,
             )
 
             batch_pred_item_ids = (

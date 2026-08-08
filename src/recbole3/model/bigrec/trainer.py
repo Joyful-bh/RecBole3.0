@@ -33,6 +33,7 @@ from recbole3.model.bigrec.config import BIGRecConfig
 from recbole3.model.bigrec.data import (
     BIGRecSFTDataset,
     build_item_text_lookup,
+    select_sft_training_records,
 )
 from recbole3.model.bigrec.generator import BIGRecGenerator
 from recbole3.model.bigrec.grounding import BIGRecGrounder
@@ -415,8 +416,22 @@ class BIGRecTrainer:
         # 2. Item text lookup.
         item_text_lookup = build_item_text_lookup(task_data, self.config)
 
-        # 3. Build training frame; optionally subsample (mirrors official BIGRec --sample flag).
+        # 3. Keep only full sliding-window histories. A user whose available
+        #    history never reaches the configured length contributes one latest
+        #    (therefore longest) row. Filter before sampling so sample_num does
+        #    not preferentially waste its budget on short prefixes.
         train_frame: pd.DataFrame = task_data.get_train_dataset().frame  # type: ignore[attr-defined]
+        unfiltered_train_size = len(train_frame)
+        train_frame = select_sft_training_records(
+            train_frame,
+            self.config.history_max_length,
+        )
+        self._log(
+            "BIGRec SFT history selection: retained %d/%d rows (history length=%s).",
+            len(train_frame),
+            unfiltered_train_size,
+            self.config.history_max_length,
+        )
 
         if self.config.sample_num > 0 and len(train_frame) > self.config.sample_num:
             train_frame = (
@@ -427,7 +442,7 @@ class BIGRecTrainer:
             self._log(
                 "sample_num=%d: subsampled %d training rows (full dataset: %d rows).",
                 self.config.sample_num, self.config.sample_num,
-                len(task_data.get_train_dataset().frame),  # type: ignore[attr-defined]
+                unfiltered_train_size,
             )
 
         # 4. Resolve effective_max_steps: when num_train_epochs finishes within
@@ -602,9 +617,6 @@ class BIGRecTrainer:
         """Return the official BIGRec 199-value gamma grid."""
         return BIGRecGrounder.default_gamma_search_values()
 
-    # 1.0  … 99.0
-        return fine + coarse  # 199 values
-
     # ── vLLM server management ────────────────────────────────────────────────
 
     def _resolve_vllm_python(self) -> str:
@@ -617,6 +629,13 @@ class BIGRecTrainer:
     ) -> tuple[list[int], list[list[int] | None]]:
         """Extract target item ids and per-row candidate lists from an eval split."""
         return BIGRecGenerator.collect_eval_targets(eval_frame)
+
+    def _collect_eval_exclusions(
+        self,
+        eval_frame: pd.DataFrame,
+    ) -> list[list[int]]:
+        """Extract per-row interaction histories used by full ranking."""
+        return BIGRecGenerator.collect_eval_exclusions(eval_frame)
 
     def _run_vllm_offline(
         self,
@@ -690,6 +709,7 @@ class BIGRecTrainer:
         cand_lists: list[list[int] | None],
         device: torch.device,
         gamma_values: tuple[float, ...],
+        excluded_item_ids: list[list[int]] | None = None,
     ) -> dict[str, float]:
         """Grid-search for the best gamma per metric@K on a validation split."""
         return self._grounder().run_gamma_search(
@@ -699,6 +719,7 @@ class BIGRecTrainer:
             cand_lists,
             device,
             gamma_values,
+            excluded_item_ids,
             compute_metrics=self._compute_metrics,
         )
 
@@ -710,10 +731,17 @@ class BIGRecTrainer:
         cand_lists: list[list[int] | None],
         best_gammas: dict[str, float],
         device: torch.device,
+        excluded_item_ids: list[list[int]] | None = None,
     ) -> dict[str, float]:
         """Evaluate a split using the best gamma independently per metric@K."""
         return self._grounder().evaluate_from_dist_per_k_gammas(
-            dist, grounding_weights, target_ids, cand_lists, best_gammas, device
+            dist,
+            grounding_weights,
+            target_ids,
+            cand_lists,
+            best_gammas,
+            device,
+            excluded_item_ids,
         )
 
     def evaluate(
@@ -783,6 +811,9 @@ class BIGRecTrainer:
         valid_texts: list[str] | None = None
         valid_targets: list[int] | None = None
         valid_cands: list[list[int] | None] | None = None
+        valid_excluded_item_ids: list[list[int]] | None = None
+
+        excluded_item_ids = self._collect_eval_exclusions(eval_frame)
 
         # Generation runs in a one-shot vLLM subprocess (LLM.beam_search):
         # vLLM ≥ 0.6.4 dropped use_beam_search from the OpenAI-compatible
@@ -809,6 +840,7 @@ class BIGRecTrainer:
                 max_valid_users: int = self.config.max_steps * self.config.eval_batch_size
                 if len(valid_frame) > max_valid_users:
                     valid_frame = valid_frame.head(max_valid_users).reset_index(drop=True)
+            valid_excluded_item_ids = self._collect_eval_exclusions(valid_frame)
             valid_texts, valid_targets, valid_cands = self._generate_all_titles_vllm(
                 valid_frame, item_text_lookup, checkpoint_path, gen_work_dir,
             )
@@ -867,6 +899,7 @@ class BIGRecTrainer:
                 valid_dist, weights_device,
                 valid_targets, valid_cands,  # type: ignore[arg-type]
                 device, gamma_values,
+                valid_excluded_item_ids,
             )
 
             self._log("Eval phase 3b: evaluating %s with per-K best gammas …", split)
@@ -878,7 +911,13 @@ class BIGRecTrainer:
                 eval_oracle_embs.to(device), item_emb_device, p=2.0
             )  # [N_eval, num_items]
             return self._evaluate_from_dist_per_k_gammas(
-                eval_dist, weights_device, target_ids, cand_lists, best_gammas, device
+                eval_dist,
+                weights_device,
+                target_ids,
+                cand_lists,
+                best_gammas,
+                device,
+                excluded_item_ids,
             )
 
         return self._rank_from_texts(
@@ -890,6 +929,7 @@ class BIGRecTrainer:
             cand_lists=cand_lists,
             grounding_weights=grounding_weights,
             device=device,
+            excluded_item_ids=excluded_item_ids,
         )
 
     def _rank_from_texts(
@@ -902,6 +942,7 @@ class BIGRecTrainer:
         cand_lists: list[list[int] | None],
         grounding_weights: torch.Tensor | None,
         device: torch.device,
+        excluded_item_ids: list[list[int]] | None = None,
     ) -> dict[str, float]:
         """Batch-wise oracle embedding extraction + L2 ranking + metrics."""
         return self._grounder().rank_from_texts(
@@ -913,6 +954,7 @@ class BIGRecTrainer:
             cand_lists,
             grounding_weights,
             device,
+            excluded_item_ids,
             extract_embeddings=self._extract_embeddings,
             compute_metrics=self._compute_metrics,
         )

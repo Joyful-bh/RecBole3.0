@@ -27,7 +27,7 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from recbole3.dataset.utils import ITEM_ID
+from recbole3.dataset.utils import ITEM_ID, USER_ID
 from recbole3.model.sequential import BaseSequentialModelDataset, HISTORY_ITEM_IDS
 
 if TYPE_CHECKING:
@@ -477,6 +477,52 @@ class BIGRecSFTDataset(Dataset):
         return self._samples[index]
 
 
+def select_sft_training_records(
+    records: pd.DataFrame,
+    history_max_length: int | None,
+) -> pd.DataFrame:
+    """Select the autoregressive rows used for BIGRec fine-tuning.
+
+    Users that reach the configured history length contribute every full
+    sliding-window row.  Users that never reach it contribute exactly their
+    latest row, whose history is also their longest one.  Evaluation frames are
+    deliberately not filtered by this helper.
+
+    Args:
+        records: Autoregressive training frame in chronological row order.
+        history_max_length: Required full history length. ``None`` keeps all
+            rows for backwards-compatible unbounded-history experiments.
+
+    Returns:
+        A new frame preserving the original row order and columns.
+    """
+    if records.empty or history_max_length is None:
+        return records.copy().reset_index(drop=True)
+    if history_max_length <= 0:
+        raise ValueError("history_max_length must be None or a positive integer.")
+    required_columns = {USER_ID, HISTORY_ITEM_IDS}
+    missing = required_columns.difference(records.columns)
+    if missing:
+        raise ValueError(
+            "BIGRec SFT record selection requires columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    history_lengths = records[HISTORY_ITEM_IDS].map(lambda value: len(value or ()))
+    full_mask = history_lengths.eq(int(history_max_length))
+    full_records = records.loc[full_mask]
+
+    users_with_full_history = set(full_records[USER_ID].tolist())
+    short_records = records.loc[~records[USER_ID].isin(users_with_full_history)]
+    # Histories are non-decreasing within a user in the framework-generated
+    # autoregressive frame, so the final row is the unique desired sample (or
+    # the latest row in the presence of non-positive interactions).
+    short_records = short_records.groupby(USER_ID, sort=False, group_keys=False).tail(1)
+
+    selected = pd.concat([full_records, short_records], axis=0).sort_index(kind="stable")
+    return selected.reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # Helpers for the inference path
 # ---------------------------------------------------------------------------
@@ -538,4 +584,5 @@ __all__ = [
     "build_instruction",
     "build_item_text_lookup",
     "build_prompt",
+    "select_sft_training_records",
 ]

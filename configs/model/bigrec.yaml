@@ -60,7 +60,7 @@ model:
   domain: product                       # "movie", "product", or "item"
   embedding_batch_size: 32
   embedding_cache_dir: outputs/bigrec/embeddings
-  refresh_embedding_cache: true
+  refresh_embedding_cache: false        # reuse item embeddings across repeated evaluation runs
   embedding_use_base_model: true        # use base (non-LoRA) model for embeddings
 
   # ── Grounding Weight Injection (Eq. 3) ───────────────────────────────────────
@@ -80,6 +80,7 @@ model:
     - 10
     - 20
   eval_protocol: full                   # "sampled" or "full"
+  exclude_history: false                # full only: mask items in seen_item_ids before Top-K
   eval_user_num: 5000                   # -1 = all; 5000 mirrors official test set size
 
   # ── vLLM Offline Beam-Search (used for generation during evaluation) ────────

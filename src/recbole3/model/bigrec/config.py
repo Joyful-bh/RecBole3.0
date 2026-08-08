@@ -238,8 +238,13 @@ class BIGRecConfig(SequentialModelConfig):
 
     # ── Embedding Grounding (Eval Step 2) ─────────────────────────────────────
     history_max_length: int | None = field(
-        default=10,
-        metadata={"help": "Number of most-recent history items included in the prompt. Paper uses 10."},
+        default=20,
+        metadata={
+            "help": (
+                "Number of most-recent history items included in the prompt. "
+                "RecBole3 BIGRec experiments use 20."
+            )
+        },
     )
     item_text_field: str = field(
         default="title",
@@ -371,6 +376,15 @@ class BIGRecConfig(SequentialModelConfig):
                 "Evaluation protocol passed to BaseTaskDataset.prepare(). "
                 "'sampled': rank pre-defined candidate sets. "
                 "'full': rank all items (expensive but matches the paper's all-rank setting)."
+            )
+        },
+    )
+    exclude_history: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether full-ranking evaluation excludes items in each request's "
+                "seen_item_ids history. Ignored for sampled evaluation."
             )
         },
     )

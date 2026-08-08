@@ -17,7 +17,7 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
-from recbole3.dataset.utils import CANDIDATE_ITEM_IDS, ITEM_ID
+from recbole3.dataset.utils import CANDIDATE_ITEM_IDS, ITEM_ID, SEEN_ITEM_IDS
 from recbole3.model.bigrec.config import BIGRecConfig
 from recbole3.model.bigrec.data import build_eval_prompts
 
@@ -95,6 +95,21 @@ class BIGRecGenerator:
             else:
                 cand_lists.append(list(cand_val))
         return target_ids, cand_lists
+
+    @staticmethod
+    def collect_eval_exclusions(eval_frame: pd.DataFrame) -> list[list[int]]:
+        """Return per-request histories used by full-ranking exclusion."""
+        if SEEN_ITEM_IDS not in eval_frame.columns:
+            return [[] for _ in range(len(eval_frame))]
+        exclusions: list[list[int]] = []
+        for seen_item_ids in eval_frame[SEEN_ITEM_IDS].tolist():
+            if seen_item_ids is None or (
+                isinstance(seen_item_ids, float) and np.isnan(seen_item_ids)
+            ):
+                exclusions.append([])
+            else:
+                exclusions.append([int(item_id) for item_id in seen_item_ids])
+        return exclusions
 
     def run_vllm_offline(
         self,

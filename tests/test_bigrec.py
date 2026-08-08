@@ -50,6 +50,7 @@ from recbole3.model.bigrec import (
     build_instruction,
     build_item_text_lookup,
     build_prompt,
+    select_sft_training_records,
 )
 from recbole3.model.bigrec.data import _DOMAIN_VOCAB, _PROMPT_PREAMBLE
 from recbole3.model.sequential import HISTORY_ITEM_IDS
@@ -216,10 +217,16 @@ class TestBIGRecConfig:
         assert BIGRecConfig().domain == "product"
 
     def test_default_history_max_length(self) -> None:
-        assert BIGRecConfig().history_max_length == 10
+        assert BIGRecConfig().history_max_length == 20
 
     def test_default_eval_protocol_is_sampled(self) -> None:
         assert BIGRecConfig().eval_protocol == "sampled"
+
+    def test_exclude_history_defaults_false(self) -> None:
+        assert BIGRecConfig().exclude_history is False
+
+    def test_exclude_history_can_be_enabled(self) -> None:
+        assert BIGRecConfig(exclude_history=True).exclude_history is True
 
     def test_default_lora_params(self) -> None:
         cfg = BIGRecConfig()
@@ -617,6 +624,48 @@ class TestBIGRecSFTDataset:
         avg_short = np.mean([len(ds_short[i]["input_ids"]) for i in range(len(ds_short))])
         avg_long = np.mean([len(ds_long[i]["input_ids"]) for i in range(len(ds_long))])
         assert avg_short <= avg_long
+
+
+class TestSelectSFTTrainingRecords:
+    def test_keeps_all_full_sliding_windows_and_one_short_user_row(self) -> None:
+        records = pd.DataFrame(
+            {
+                USER_ID: [0, 0, 0, 0, 1, 1],
+                ITEM_ID: [0, 1, 2, 3, 4, 5],
+                HISTORY_ITEM_IDS: [
+                    (),
+                    (0,),
+                    (0, 1),
+                    (1, 2),
+                    (),
+                    (4,),
+                ],
+            }
+        )
+
+        selected = select_sft_training_records(records, history_max_length=2)
+
+        assert selected[[USER_ID, ITEM_ID]].to_dict("records") == [
+            {USER_ID: 0, ITEM_ID: 2},
+            {USER_ID: 0, ITEM_ID: 3},
+            {USER_ID: 1, ITEM_ID: 5},
+        ]
+        assert selected[HISTORY_ITEM_IDS].map(len).tolist() == [2, 2, 1]
+
+    def test_short_user_contributes_only_longest_history(self) -> None:
+        records = pd.DataFrame(
+            {
+                USER_ID: [7, 7, 7],
+                ITEM_ID: [10, 11, 12],
+                HISTORY_ITEM_IDS: [(), (10,), (10, 11)],
+            }
+        )
+
+        selected = select_sft_training_records(records, history_max_length=20)
+
+        assert len(selected) == 1
+        assert selected.iloc[0][ITEM_ID] == 12
+        assert selected.iloc[0][HISTORY_ITEM_IDS] == (10, 11)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1043,6 +1092,31 @@ def _stub_fit_externals(
 
 class TestTrainerFit:
     """Smoke tests for BIGRecTrainer.fit — mocks out all HF Trainer machinery."""
+
+    def test_fit_filters_autoregressive_prefixes_before_sft(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        data, _ = _prepare_bigrec_data(history_max_length=2)
+        cfg = BIGRecConfig(
+            history_max_length=2,
+            max_input_length=32,
+            max_new_tokens=8,
+            sample_num=-1,
+        )
+        trainer = BIGRecTrainer(cfg)
+        _stub_fit_externals(trainer, monkeypatch)
+        captured: dict[str, Any] = {}
+
+        def _capture(**kwargs: Any) -> MagicMock:
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch("recbole3.model.bigrec.trainer.HFTrainer", side_effect=_capture):
+            trainer.fit(data, output_dir=str(tmp_path))
+
+        # Each stub user has only two training interactions, producing history
+        # lengths 0 and 1. Neither reaches 2, so each contributes one row.
+        assert len(captured["train_dataset"]) == 2
 
     def test_fit_returns_checkpoint_path(
         self, tmp_path, monkeypatch: pytest.MonkeyPatch
@@ -1836,6 +1910,91 @@ class TestDefaultGammaSearchValues:
 # ══════════════════════════════════════════════════════════════════════════════
 # 19. _run_gamma_search and _evaluate_from_dist_per_k_gammas
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestExcludeHistory:
+    def _trainer(
+        self,
+        *,
+        exclude_history: bool,
+        eval_protocol: str = "full",
+    ) -> BIGRecTrainer:
+        return BIGRecTrainer(
+            BIGRecConfig(
+                exclude_history=exclude_history,
+                eval_protocol=eval_protocol,
+                eval_topk=(1,),
+                eval_metrics=("recall",),
+                embedding_batch_size=2,
+            )
+        )
+
+    def test_collects_seen_item_ids_and_normalizes_missing_values(self) -> None:
+        trainer = self._trainer(exclude_history=True)
+        frame = pd.DataFrame({SEEN_ITEM_IDS: [(1, 2), None, np.nan]})
+
+        assert trainer._collect_eval_exclusions(frame) == [[1, 2], [], []]
+
+    def test_missing_seen_item_ids_column_produces_empty_histories(self) -> None:
+        trainer = self._trainer(exclude_history=True)
+
+        assert trainer._collect_eval_exclusions(pd.DataFrame({ITEM_ID: [1, 2]})) == [[], []]
+
+    def test_full_ranking_masks_seen_items_when_enabled(self) -> None:
+        trainer = self._trainer(exclude_history=True)
+        dist = torch.tensor([[0.0, 0.1, 0.2]])
+
+        masked = trainer._grounder().mask_history_items(dist, [[0, 1]])
+
+        assert torch.isinf(masked[0, 0])
+        assert torch.isinf(masked[0, 1])
+        assert masked[0, 2] == pytest.approx(0.2)
+        assert torch.equal(dist, torch.tensor([[0.0, 0.1, 0.2]]))
+
+    def test_full_ranking_leaves_history_when_disabled(self) -> None:
+        trainer = self._trainer(exclude_history=False)
+        dist = torch.tensor([[0.0, 0.1, 0.2]])
+
+        assert trainer._grounder().mask_history_items(dist, [[0, 1]]) is dist
+
+    def test_sampled_ranking_ignores_history_exclusion(self) -> None:
+        trainer = self._trainer(exclude_history=True, eval_protocol="sampled")
+        dist = torch.tensor([[0.0, 0.1, 0.2]])
+
+        assert trainer._grounder().mask_history_items(dist, [[0, 1]]) is dist
+
+    def test_history_row_count_must_match_distance_rows(self) -> None:
+        trainer = self._trainer(exclude_history=True)
+
+        with pytest.raises(ValueError, match="row count"):
+            trainer._grounder().mask_history_items(torch.zeros(2, 3), [[0]])
+
+    def test_rank_from_texts_excludes_nearest_seen_item(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        trainer = self._trainer(exclude_history=True)
+        item_embeddings = torch.tensor([[0.0], [1.0], [2.0]])
+
+        monkeypatch.setattr(
+            trainer,
+            "_extract_embeddings",
+            lambda model, tokenizer, texts, batch_size, device: torch.zeros(len(texts), 1),
+        )
+
+        results = trainer._rank_from_texts(
+            emb_model=_FakeModel(),
+            tokenizer=_MockTokenizer(),
+            item_emb_device=item_embeddings,
+            generated_texts=["generated"],
+            target_ids=[1],
+            cand_lists=[None],
+            grounding_weights=None,
+            device=torch.device("cpu"),
+            excluded_item_ids=[[0]],
+        )
+
+        assert results["recall@1"] == pytest.approx(1.0)
 
 
 class TestGammaSearch:

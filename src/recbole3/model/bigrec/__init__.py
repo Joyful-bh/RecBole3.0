@@ -15,6 +15,7 @@ from recbole3.model.bigrec.data import (
     build_instruction,
     build_item_text_lookup,
     build_prompt,
+    select_sft_training_records,
 )
 from recbole3.model.bigrec.generator import BIGRecGenerator
 from recbole3.model.bigrec.grounding import BIGRecGrounder
@@ -35,4 +36,5 @@ __all__ = [
     "build_instruction",
     "build_item_text_lookup",
     "build_prompt",
+    "select_sft_training_records",
 ]
